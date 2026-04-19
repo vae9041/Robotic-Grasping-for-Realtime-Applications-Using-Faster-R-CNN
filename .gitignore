@@ -1,0 +1,64 @@
+# --- Model weights & exports (do not push) ---
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.trt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --- Virtual environments ---
+faster_rcnn_env/
+venv/
+.env/
+.venv/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# --- Local datasets & large media (download separately; do not push) ---
+cornell_dataset/
+jacquard_dataset/
+augmented_dataset/
+images/
+images_50/
+
+# --- Trained checkpoints & experiment folders (weights excluded by *.pth; ignore dirs for any extras) ---
+trained_models*/
+models_*/
+tmp_structured*/
+frozen_backbone_test/
+cornell_eval_frozen/
+jacquard_eval_frozen/
+
+# --- Large generated assets ---
+model_visualizations/
+
+# --- Evaluation / inference outputs (often large JSON + images) ---
+evaluation_results*/
+evaluation_results_*/
+*_evaluation*/
+jacquard_eval*/
+jacquard_evaluation*/
+cornell_evaluation*/
+trained_models97.06pct/
+*_out*/
+*_inference*/
