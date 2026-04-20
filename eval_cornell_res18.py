@@ -71,8 +71,6 @@ def main():
                         help="Confidence threshold for predictions")
     parser.add_argument("--iou_threshold", type=float, default=0.25,
                         help="IoU threshold for positive matches")
-    parser.add_argument("--angle_threshold_deg", type=float, default=30.0,
-                        help="Maximum allowed orientation offset in degrees")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Maximum number of samples to evaluate (None for all)")
     parser.add_argument("--output_dir", type=str, default="./evaluation_results_res18",
@@ -103,7 +101,6 @@ def main():
         confidence_threshold=args.confidence_threshold,
         iou_threshold=args.iou_threshold,
         max_samples=args.max_samples,
-        angle_threshold_deg=args.angle_threshold_deg,
     )
 
     print("\n" + "=" * 60)
@@ -114,7 +111,6 @@ def main():
     print(f"Samples evaluated: {metrics['num_samples']}")
     print(f"Confidence threshold: {metrics['confidence_threshold']}")
     print(f"IoU threshold: {metrics['iou_threshold']}")
-    print(f"Angle threshold: {args.angle_threshold_deg} deg")
 
     print("\n" + "=" * 20 + " PER-GRASP METRICS " + "=" * 20)
     print(f"Precision: {metrics['precision']:.4f}")
@@ -128,7 +124,7 @@ def main():
     print(f"Total GT Grasps: {metrics['total_gt_grasps']}")
     print(f"Total Predictions: {metrics['total_pred_grasps']}")
 
-    print("\n" + "=" * 12 + " IoU + ANGLE SUCCESS RATE " + "=" * 12)
+    print("\n" + "=" * 18 + " IoU-BASED SUCCESS RATE " + "=" * 18)
     print(f"Success Rate (Accuracy): {success_metrics['accuracy']:.4f} ({success_metrics['accuracy'] * 100:.2f}%)")
     print(f"Correct Predictions: {success_metrics['correct_predictions']}")
     print(f"Total Images: {success_metrics['total_images']}")

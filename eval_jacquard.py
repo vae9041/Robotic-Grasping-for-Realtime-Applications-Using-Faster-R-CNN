@@ -175,16 +175,6 @@ class GraspRectangle:
         return intersection_area / union_area
 
 
-def _angle_diff_deg(angle_a_rad: float, angle_b_rad: float) -> float:
-    """
-    Smallest grasp orientation offset in degrees with 180-degree symmetry.
-    """
-    diff = abs(angle_a_rad - angle_b_rad) % math.pi
-    if diff > (math.pi / 2.0):
-        diff = math.pi - diff
-    return math.degrees(diff)
-
-
 class JacquardDataset:
     """Dataset loader for Jacquard grasp dataset."""
     
@@ -495,13 +485,8 @@ class JacquardEvaluator:
         
         return results
     
-    def evaluate_success_rate(
-        self,
-        confidence_threshold: float = 0.5,
-        iou_threshold: float = 0.25,
-        max_samples: Optional[int] = None,
-        angle_threshold_deg: float = 30.0,
-    ) -> Dict:
+    def evaluate_success_rate(self, confidence_threshold: float = 0.5, iou_threshold: float = 0.25,
+                             max_samples: Optional[int] = None) -> Dict:
         """
         Evaluate using IoU-based success rate.
         For each image, select the best predicted grasp and check if it has IoU >= threshold with any GT grasp.
@@ -576,22 +561,14 @@ class JacquardEvaluator:
                 best_pred_box[2], best_pred_box[3]
             )
             
-            # Check IoU with all ground truth grasps and track best match for angle check
+            # Check IoU with all ground truth grasps
             max_iou = 0.0
-            best_gt_for_iou: Optional[GraspRectangle] = None
             for gt_grasp in gt_grasps:
                 iou = best_pred_grasp.intersection_over_union(gt_grasp)
-                if iou > max_iou:
-                    max_iou = iou
-                    best_gt_for_iou = gt_grasp
+                max_iou = max(max_iou, iou)
 
-            # Success requires IoU and orientation agreement.
-            angle_diff = None
-            angle_ok = False
-            if best_gt_for_iou is not None:
-                angle_diff = _angle_diff_deg(best_pred_grasp.angle, best_gt_for_iou.angle)
-                angle_ok = angle_diff <= angle_threshold_deg
-            success = (max_iou >= iou_threshold) and angle_ok
+            # Count as correct if IoU >= threshold
+            success = max_iou >= iou_threshold
             if success:
                 correct_predictions += 1
             
@@ -602,19 +579,10 @@ class JacquardEvaluator:
                 'folder': sample['folder'],
                 'success': success,
                 'best_iou': max_iou,
-                'best_angle_diff_deg': angle_diff,
                 'best_score': best_pred_score,
                 'num_predictions': len(pred_boxes),
                 'num_gt_grasps': len(gt_grasps),
-                'reason': (
-                    'Success'
-                    if success
-                    else (
-                        f'IoU {max_iou:.3f} < {iou_threshold}'
-                        if max_iou < iou_threshold
-                        else f'angle diff {angle_diff:.2f} > {angle_threshold_deg}'
-                    )
-                )
+                'reason': 'Success' if success else f'IoU {max_iou:.3f} < {iou_threshold}'
             })
         
         # Calculate final metrics
@@ -626,7 +594,6 @@ class JacquardEvaluator:
             'total_images': total_images,
             'confidence_threshold': confidence_threshold,
             'iou_threshold': iou_threshold,
-            'angle_threshold_deg': angle_threshold_deg,
             'detailed_results': detailed_results
         }
         
@@ -718,8 +685,6 @@ def main():
                         help='Confidence threshold for predictions')
     parser.add_argument('--iou_threshold', type=float, default=0.25,
                         help='IoU threshold for positive matches')
-    parser.add_argument('--angle_threshold_deg', type=float, default=30.0,
-                        help='Maximum allowed orientation offset in degrees')
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Maximum number of samples to evaluate')
     parser.add_argument('--output_dir', type=str, default='jacquard_evaluation',
@@ -750,8 +715,7 @@ def main():
     success_results = evaluator.evaluate_success_rate(
         confidence_threshold=args.confidence_threshold,
         iou_threshold=args.iou_threshold,
-        max_samples=args.max_samples,
-        angle_threshold_deg=args.angle_threshold_deg,
+        max_samples=args.max_samples
     )
     
     # Print results
@@ -763,7 +727,6 @@ def main():
     print(f"Samples evaluated: {results['samples_evaluated']}")
     print(f"Confidence threshold: {args.confidence_threshold}")
     print(f"IoU threshold: {args.iou_threshold}")
-    print(f"Angle threshold: {args.angle_threshold_deg} deg")
     
     print("\n" + "="*20 + " PER-GRASP METRICS " + "="*20)
     print(f"Precision: {results['precision']:.4f}")
@@ -777,7 +740,7 @@ def main():
     print(f"Total GT Grasps: {results['total_gt_grasps']}")
     print(f"Total Predictions: {results['total_predictions']}")
     
-    print("\n" + "="*12 + " IoU + ANGLE SUCCESS RATE " + "="*12)
+    print("\n" + "="*18 + " IoU-BASED SUCCESS RATE " + "="*18)
     print(f"Success Rate (Accuracy): {success_results['accuracy']:.4f} ({success_results['accuracy']*100:.2f}%)")
     print(f"Correct Predictions: {success_results['correct_predictions']}")
     print(f"Total Images: {success_results['total_images']}")
