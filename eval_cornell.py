@@ -17,6 +17,7 @@ import matplotlib.patches as patches
 from tqdm import tqdm
 import logging
 from collections import defaultdict
+import math
 
 # Import model from training script
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
@@ -25,6 +26,35 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _angle_diff_deg(angle_a_rad: float, angle_b_rad: float) -> float:
+    """
+    Smallest grasp orientation offset in degrees with 180-degree symmetry.
+    """
+    diff = abs(angle_a_rad - angle_b_rad) % math.pi
+    if diff > (math.pi / 2.0):
+        diff = math.pi - diff
+    return math.degrees(diff)
+
+
+def _cornell_grasp_angle_rad(corners: np.ndarray) -> float:
+    """
+    Estimate grasp orientation from Cornell rectangle corners.
+    Uses the first edge orientation from the 4-point annotation.
+    """
+    p0 = corners[0]
+    p1 = corners[1]
+    return math.atan2(float(p1[1] - p0[1]), float(p1[0] - p0[0]))
+
+
+def _pred_box_angle_rad(pred_box: np.ndarray) -> float:
+    """
+    Estimate orientation for axis-aligned predicted boxes from the longer side.
+    """
+    w = float(pred_box[2] - pred_box[0])
+    h = float(pred_box[3] - pred_box[1])
+    return 0.0 if w >= h else (math.pi / 2.0)
 
 
 class CornellEvaluator:
@@ -295,8 +325,13 @@ class CornellEvaluator:
         
         return metrics, all_predictions
     
-    def evaluate_success_rate(self, confidence_threshold: float = 0.5, iou_threshold: float = 0.25,
-                             max_samples: Optional[int] = None) -> Dict:
+    def evaluate_success_rate(
+        self,
+        confidence_threshold: float = 0.5,
+        iou_threshold: float = 0.25,
+        max_samples: Optional[int] = None,
+        angle_threshold_deg: float = 30.0,
+    ) -> Dict:
         """
         Evaluate using IoU-based success rate.
         For each image, select the best predicted grasp and check if it has IoU >= threshold with any GT grasp.
@@ -350,8 +385,9 @@ class CornellEvaluator:
                     sample.get('neg_grasps_path')
                 )
                 
-                # Check IoU with all ground truth grasps
+                # Check IoU with all ground truth grasps and keep best match for angle check
                 max_iou = 0.0
+                best_gt_corners = None
                 for gt_grasp_corners in gt_grasps:
                     # Scale ground truth to match resized image
                     scaled_gt_corners = gt_grasp_corners.copy()
@@ -365,10 +401,20 @@ class CornellEvaluator:
                     
                     gt_grasp = GraspRectangle.from_bbox(gt_bbox[0], gt_bbox[1], gt_bbox[2], gt_bbox[3])
                     iou = best_pred_grasp.intersection_over_union(gt_grasp)
-                    max_iou = max(max_iou, iou)
-                
-                # Count as correct if IoU >= threshold
-                success = max_iou >= iou_threshold
+                    if iou > max_iou:
+                        max_iou = iou
+                        best_gt_corners = scaled_gt_corners
+
+                pred_angle = _pred_box_angle_rad(best_pred_box)
+                angle_diff = None
+                angle_ok = False
+                if best_gt_corners is not None:
+                    gt_angle = _cornell_grasp_angle_rad(best_gt_corners)
+                    angle_diff = _angle_diff_deg(pred_angle, gt_angle)
+                    angle_ok = angle_diff <= angle_threshold_deg
+
+                # Success requires both IoU and orientation agreement.
+                success = (max_iou >= iou_threshold) and angle_ok
                 if success:
                     correct_predictions += 1
                 
@@ -376,10 +422,19 @@ class CornellEvaluator:
                     'sample_name': sample['name'],
                     'success': success,
                     'best_iou': max_iou,
+                    'best_angle_diff_deg': angle_diff,
                     'best_score': best_pred_score,
                     'num_predictions': len(pred_boxes),
                     'num_gt_grasps': len(gt_grasps),
-                    'reason': 'Success' if success else f'IoU {max_iou:.3f} < {iou_threshold}'
+                    'reason': (
+                        'Success'
+                        if success
+                        else (
+                            f'IoU {max_iou:.3f} < {iou_threshold}'
+                            if max_iou < iou_threshold
+                            else f'angle diff {angle_diff:.2f} > {angle_threshold_deg}'
+                        )
+                    )
                 })
                 
             except Exception as e:
@@ -403,6 +458,7 @@ class CornellEvaluator:
             'total_images': total_images,
             'confidence_threshold': confidence_threshold,
             'iou_threshold': iou_threshold,
+            'angle_threshold_deg': angle_threshold_deg,
             'detailed_results': detailed_results
         }
         
@@ -467,6 +523,8 @@ def main():
                        help='Confidence threshold for predictions')
     parser.add_argument('--iou_threshold', type=float, default=0.25,
                        help='IoU threshold for positive matches')
+    parser.add_argument('--angle_threshold_deg', type=float, default=30.0,
+                       help='Maximum allowed orientation offset in degrees')
     parser.add_argument('--max_samples', type=int, default=None,
                        help='Maximum number of samples to evaluate (None for all)')
     parser.add_argument('--output_dir', type=str, default='./evaluation_results',
@@ -500,7 +558,8 @@ def main():
     success_metrics = evaluator.evaluate_success_rate(
         confidence_threshold=args.confidence_threshold,
         iou_threshold=args.iou_threshold,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        angle_threshold_deg=args.angle_threshold_deg,
     )
     
     # Print results
@@ -512,6 +571,7 @@ def main():
     print(f"Samples evaluated: {metrics['num_samples']}")
     print(f"Confidence threshold: {metrics['confidence_threshold']}")
     print(f"IoU threshold: {metrics['iou_threshold']}")
+    print(f"Angle threshold: {args.angle_threshold_deg} deg")
     
     print("\n" + "="*20 + " PER-GRASP METRICS " + "="*20)
     print(f"Precision: {metrics['precision']:.4f}")
@@ -525,7 +585,7 @@ def main():
     print(f"Total GT Grasps: {metrics['total_gt_grasps']}")
     print(f"Total Predictions: {metrics['total_pred_grasps']}")
     
-    print("\n" + "="*18 + " IoU-BASED SUCCESS RATE " + "="*18)
+    print("\n" + "="*12 + " IoU + ANGLE SUCCESS RATE " + "="*12)
     print(f"Success Rate (Accuracy): {success_metrics['accuracy']:.4f} ({success_metrics['accuracy']*100:.2f}%)")
     print(f"Correct Predictions: {success_metrics['correct_predictions']}")
     print(f"Total Images: {success_metrics['total_images']}")

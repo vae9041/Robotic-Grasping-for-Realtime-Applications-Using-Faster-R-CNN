@@ -117,6 +117,7 @@ python eval_cornell.py \
   --cornell_path ./cornell_dataset \
   --confidence_threshold 0.5 \
   --iou_threshold 0.25 \
+  --angle_threshold_deg 30 \
   --output_dir ./evaluation_results
 ```
 
@@ -128,6 +129,7 @@ python eval_jacquard.py \
   --jacquard_path ./jacquard_dataset \
   --confidence_threshold 0.5 \
   --iou_threshold 0.25 \
+  --angle_threshold_deg 30 \
   --output_dir ./jacquard_evaluation
 ```
 
@@ -137,6 +139,9 @@ python eval_jacquard.py \
 python eval_cornell_res18.py --model_path ./path/to/resnet18.pth --cornell_path ./cornell_dataset --output_dir ./evaluation_results_res18
 python eval_jacquard_res18.py --model_path ./path/to/resnet18.pth --jacquard_path ./jacquard_dataset --output_dir ./jacquard_eval_res18
 ```
+
+`--angle_threshold_deg` enforces the orientation condition used in the paper:
+`|theta_pred - theta_gt| <= 30°` (with 180° grasp symmetry), in addition to the IoU threshold.
 
 ---
 
