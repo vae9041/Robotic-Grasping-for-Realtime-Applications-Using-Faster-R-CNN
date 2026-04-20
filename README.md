@@ -12,8 +12,8 @@ This repository contains **training, evaluation, offline augmentation, RealSense
 | Setting | Cornell (image-level) | Jacquard | Notes |
 |--------|------------------------|----------|--------|
 | ResNet-50 Faster R-CNN | **98.76%** | **90.6%** | Deepest backbone; strongest accuracy |
-| Inference (representative GPU) | — | — | **~32 ms** forward time reported for the full detector (paper) |
-| Structured-pruned ResNet-18 | Competitive with full R-18 (see eval logs) | — | **~7.66 ms** inference; FPN-focused pruning in-repo |
+| Inference (NVIDIA RTX 6000 GPU) | **13.2 ms** forward time reported for the full detector |
+| Structured-pruned ResNet-18 | Competitive with full R-18 (see eval logs) | **7.66 ms** inference; FPN-focused pruning in-repo |
 
 Evaluation protocol for Cornell/Jacquard in this codebase typically uses **confidence 0.5** and **IoU 0.25** for image-level success unless you override flags.
 
@@ -224,23 +224,3 @@ Per-grasp precision/recall/F1 vary; see JSON under your chosen `--output_dir`.
 - **Structured checkpoint load errors**: use `eval_*_res18.py` or inference scripts that call `load_structured_pruned_state_dict`; ensure `torch`/`torchvision` versions match training.
 
 ---
-
-## Citation
-
-If you use this code or the associated paper, please cite the manuscript (update with venue/page numbers when published):
-
-```bibtex
-@misc{eloy2026grasping,
-  title={Robotic Grasping for Real-Time Applications Using Faster {R-CNN}},
-  author={Eloy, Vincent and Sahin, Ferat},
-  year={2026},
-  institution={Rochester Institute of Technology},
-  note={Draft / preprint }
-}
-```
-
----
-
-## License
-
-Specify your license here (e.g., MIT) if you release the repository publicly.
