@@ -216,8 +216,10 @@ Reported best table rows from internal evaluation logs (ResNet-50, AdamW + cosin
 Per-grasp precision/recall/F1 vary; see JSON under your chosen `--output_dir`.
 
 ---
+## Trained Models
 
-Trained models are in: model_resnet_50/, models_resnet18_v2/, Pruned_model_v3/ accessed in this link: https://drive.google.com/drive/folders/17vggB7ATP2DyJ13ozPqiVgVsqpdW-pKY?usp=sharing
+Trained models are in: model_resnet_50/, models_resnet18_v2/, Pruned_model_v3/ accessed here: https://drive.google.com/drive/folders/17vggB7ATP2DyJ13ozPqiVgVsqpdW-pKY?usp=sharing
+
 ---
 ## Troubleshooting
 
