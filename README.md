@@ -7,7 +7,7 @@ PyTorch codebase for **two-stage grasp detection** with Faster R-CNN (torchvisio
 This repository contains **training, evaluation, offline augmentation, RealSense live inference, structured pruning, and latency/FLOP profiling scripts**. Robot-side **ROS 2**, **MoveIt 2**, **UR5e**, and **Intel RealSense D435** integration described in the paper is a separate deployment stack; here the focus is the **vision model and benchmarks**.
 
 
-## Highlights (from the accompanying manuscript)
+## Highlights 
 
 | Setting | Cornell (image-level) | Jacquard | Notes |
 |--------|------------------------|----------|--------|
@@ -15,7 +15,7 @@ This repository contains **training, evaluation, offline augmentation, RealSense
 | Inference (NVIDIA RTX 6000 GPU) | **13.2 ms** forward time reported for the full detector |
 | Structured-pruned ResNet-18 | Competitive with full R-18 (see eval logs) | **7.66 ms** inference; FPN-focused pruning in-repo |
 
-Evaluation protocol for Cornell/Jacquard in this codebase typically uses **confidence 0.5** and **IoU 0.25** for image-level success unless you override flags.
+Evaluation protocol for Cornell/Jacquard uses **confidence 0.5** and **IoU 0.25** for image-level success unless you override flags.
 
 ---
 
@@ -204,7 +204,7 @@ ResNet-50 checkpoint size is on the order of **41M parameters**; ResNet-18 is sm
 
 ---
 
-## Results snapshot (strong configuration)
+## Results 
 
 Reported best table rows from internal evaluation logs (ResNet-50, AdamW + cosine-style training):
 
@@ -217,6 +217,8 @@ Per-grasp precision/recall/F1 vary; see JSON under your chosen `--output_dir`.
 
 ---
 
+Trained models are in: model_resnet_50/, models_resnet18_v2/, Pruned_model_v3/ accessed in this link: https://drive.google.com/drive/folders/17vggB7ATP2DyJ13ozPqiVgVsqpdW-pKY?usp=sharing
+---
 ## Troubleshooting
 
 - **CUDA OOM**: reduce `--batch_size` in training or use a smaller backbone.
