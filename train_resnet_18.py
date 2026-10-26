@@ -31,6 +31,8 @@ from train import (
     train_one_epoch,
     freeze_backbone_parameters,
     print_model_info,
+    OrientedFastRCNNPredictor,
+    OrientedRoIHeads,
 )
 
 
@@ -40,15 +42,13 @@ logger = logging.getLogger(__name__)
 
 def get_model(num_classes: int, freeze_backbone: bool = False) -> torch.nn.Module:
     """
-    Create Faster R-CNN model with ResNet-18 FPN backbone.
+    Create Faster R-CNN model with ResNet-18 FPN backbone and oriented ROI head.
 
     Notes:
     - The Faster R-CNN detection head is initialized randomly.
     - The ResNet-18 backbone uses ImageNet pretrained weights.
     """
     # Build the backbone with FPN on top of a pretrained ResNet-18.
-    # `trainable_layers` controls how many late ResNet stages remain trainable
-    # inside `resnet_fpn_backbone` before the optional `freeze_backbone` flag.
     backbone = resnet_fpn_backbone(
         backbone_name="resnet18",
         weights=ResNet18_Weights.IMAGENET1K_V1,
@@ -56,6 +56,24 @@ def get_model(num_classes: int, freeze_backbone: bool = False) -> torch.nn.Modul
     )
 
     model = FasterRCNN(backbone, num_classes=num_classes)
+
+    # Replace the default head with the oriented predictor and head.
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    old_roi = model.roi_heads
+    new_roi = OrientedRoIHeads(
+        old_roi.box_roi_pool,
+        old_roi.box_head,
+        OrientedFastRCNNPredictor(in_features, num_classes),
+        old_roi.proposal_matcher.high_threshold,
+        old_roi.proposal_matcher.low_threshold,
+        old_roi.fg_bg_sampler.batch_size_per_image,
+        old_roi.fg_bg_sampler.positive_fraction,
+        old_roi.box_coder.weights,
+        old_roi.score_thresh,
+        old_roi.nms_thresh,
+        old_roi.detections_per_img,
+    )
+    model.roi_heads = new_roi
 
     if freeze_backbone:
         # Freeze the full backbone feature extractor (ResNet + FPN),
@@ -100,13 +118,15 @@ def evaluate_with_diagnostics(
     device: torch.device,
     confidence_threshold: float = 0.5,
     iou_threshold: float = 0.25,
+    angle_threshold: float = 30.0,
     top_k: int = 1,
 ):
     """
-    Evaluate model using IoU-based success rate with diagnostics.
+    Evaluate model using oriented-grasp success rate with diagnostics.
 
-    Success rule is preserved:
-      A prediction is counted as correct only if IoU with any GT >= iou_threshold.
+    Success rule:
+      A prediction is counted as correct only if IoU > iou_threshold
+      AND |angle difference| <= angle_threshold (degrees) with any GT grasp.
     """
     model.eval()
     total_loss = 0.0
@@ -137,6 +157,7 @@ def evaluate_with_diagnostics(
                 total_images += 1
                 scores = pred["scores"]
                 boxes = pred["boxes"]
+                angles = pred["angles"]
 
                 if scores.numel() > 0:
                     images_with_any_pred += 1
@@ -146,6 +167,7 @@ def evaluate_with_diagnostics(
 
                 keep = scores >= confidence_threshold
                 kept_boxes = boxes[keep]
+                kept_angles = angles[keep]
                 kept_scores = scores[keep]
 
                 if kept_boxes.shape[0] == 0:
@@ -155,19 +177,25 @@ def evaluate_with_diagnostics(
                 k = min(top_k, kept_boxes.shape[0])
                 topk_indices = torch.topk(kept_scores, k=k).indices
                 candidate_boxes = kept_boxes[topk_indices].cpu().numpy()
+                candidate_angles = kept_angles[topk_indices].cpu().numpy()
                 gt_boxes = target["boxes"].cpu().numpy()
+                gt_angles = target["angles"].cpu().numpy()
 
                 image_success = False
-                for box in candidate_boxes:
-                    pred_grasp = GraspRectangle.from_bbox(box[0], box[1], box[2], box[3])
-                    max_iou = 0.0
-                    for gt_box in gt_boxes:
-                        gt_grasp = GraspRectangle.from_bbox(gt_box[0], gt_box[1], gt_box[2], gt_box[3])
+                for box, angle in zip(candidate_boxes, candidate_angles):
+                    pred_grasp = GraspRectangle.from_bbox(
+                        box[0], box[1], box[2], box[3], float(angle)
+                    )
+                    for gt_box, gt_angle in zip(gt_boxes, gt_angles):
+                        gt_grasp = GraspRectangle.from_bbox(
+                            gt_box[0], gt_box[1], gt_box[2], gt_box[3], float(gt_angle)
+                        )
                         iou = pred_grasp.intersection_over_union(gt_grasp)
-                        max_iou = max(max_iou, iou)
-                    # Keep the exact IoU success requirement.
-                    if max_iou >= iou_threshold:
-                        image_success = True
+                        angle_error = pred_grasp.angle_error(gt_grasp)
+                        if iou > iou_threshold and angle_error <= angle_threshold:
+                            image_success = True
+                            break
+                    if image_success:
                         break
 
                 if image_success:
@@ -186,6 +214,7 @@ def evaluate_with_diagnostics(
         "images_with_pred_at_conf": images_with_pred_at_conf,
         "confidence_threshold": confidence_threshold,
         "iou_threshold": iou_threshold,
+        "angle_threshold": angle_threshold,
         "top_k": top_k,
         "score_mean": float(score_array.mean()),
         "score_median": float(np.median(score_array)),
@@ -272,6 +301,7 @@ def main() -> None:
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    flops_log_path = output_dir / "flops.jsonl"
 
     # Define data sources
     data_sources = []
@@ -385,6 +415,7 @@ def main() -> None:
             device,
             epoch + 1,
             grad_clip=args.grad_clip,
+            flops_log_path=flops_log_path,
         )
         train_loss = train_metrics["total_loss"]
         train_losses.append(train_loss)

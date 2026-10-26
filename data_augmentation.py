@@ -90,14 +90,14 @@ class GraspRectangle:
         center_x = np.mean(corners[:, 0])
         center_y = np.mean(corners[:, 1])
         
-        # Calculate width and height
+        # Calculate width and height from the actual edge order
         width = np.linalg.norm(corners[1] - corners[0])
         height = np.linalg.norm(corners[2] - corners[1])
         
-        # Calculate angle
+        # Calculate angle using y-down image convention and canonicalize to [0, 180)
         dx = corners[1, 0] - corners[0, 0]
-        dy = corners[1, 1] - corners[0, 1]
-        angle = np.degrees(np.arctan2(dy, dx))
+        dy = corners[0, 1] - corners[1, 1]  # flip y for image coordinates
+        angle = np.degrees(np.arctan2(dy, dx)) % 180
         
         return cls(center_x, center_y, angle, width, height, quality)
     
@@ -134,7 +134,7 @@ class CornellDataset:
                     if 'cpos' not in file.name and 'cneg' not in file.name:
                         base_name = file.stem
                         rgb_file = folder / f"{base_name}r.png"
-                        depth_file = folder / f"{base_name}d.png"
+                        depth_file = folder / f"{base_name}d.tiff"
                         pos_file = folder / f"{base_name}cpos.txt"
                         neg_file = folder / f"{base_name}cneg.txt"
                         

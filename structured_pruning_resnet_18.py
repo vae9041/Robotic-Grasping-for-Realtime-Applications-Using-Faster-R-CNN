@@ -412,9 +412,24 @@ def load_structured_pruned_state_dict(
         model.roi_heads.box_head = TwoMLPHead(fc6_in, rep).to(
             device=device, dtype=sd["roi_heads.box_head.fc6.weight"].dtype
         )
-        model.roi_heads.box_predictor = FastRCNNPredictor(rep, num_classes).to(
-            device=device, dtype=sd["roi_heads.box_predictor.cls_score.weight"].dtype
+
+        from train import OrientedFastRCNNPredictor, OrientedRoIHeads
+        old_roi = model.roi_heads
+        new_roi = OrientedRoIHeads(
+            old_roi.box_roi_pool,
+            model.roi_heads.box_head,
+            OrientedFastRCNNPredictor(rep, num_classes),
+            old_roi.proposal_matcher.high_threshold,
+            old_roi.proposal_matcher.low_threshold,
+            old_roi.fg_bg_sampler.batch_size_per_image,
+            old_roi.fg_bg_sampler.positive_fraction,
+            old_roi.box_coder.weights,
+            old_roi.score_thresh,
+            old_roi.nms_thresh,
+            old_roi.detections_per_img,
         )
+        new_roi.to(device=device, dtype=sd["roi_heads.box_predictor.cls_score.weight"].dtype)
+        model.roi_heads = new_roi
 
     # Keep Faster R-CNN bookkeeping consistent with reconstructed width.
     if meta and meta.get("fpn_uniform_wrapper"):
@@ -435,16 +450,31 @@ def rebuild_detector_heads_for_backbone_width(model: nn.Module, num_classes: int
     n_anchors = model.rpn.anchor_generator.num_anchors_per_location()[0]
     model.rpn.head = RPNHead(backbone_out_ch, n_anchors).to(device=device, dtype=dtype)
 
-    resolution = model.roi_heads.box_roi_pool.output_size[0]
-    if not isinstance(model.roi_heads.box_head, TwoMLPHead):
+    old_roi = model.roi_heads
+    resolution = old_roi.box_roi_pool.output_size[0]
+    if not isinstance(old_roi.box_head, TwoMLPHead):
         raise TypeError("Expected torchvision TwoMLPHead on roi_heads.box_head; edit script for custom heads.")
-    representation_size = model.roi_heads.box_head.fc7.out_features
+    representation_size = old_roi.box_head.fc7.out_features
+    from train import OrientedFastRCNNPredictor, OrientedRoIHeads
+
     model.roi_heads.box_head = TwoMLPHead(
         backbone_out_ch * resolution**2, representation_size
     ).to(device=device, dtype=dtype)
-    model.roi_heads.box_predictor = FastRCNNPredictor(representation_size, num_classes).to(
-        device=device, dtype=dtype
+    new_roi = OrientedRoIHeads(
+        old_roi.box_roi_pool,
+        model.roi_heads.box_head,
+        OrientedFastRCNNPredictor(representation_size, num_classes),
+        old_roi.proposal_matcher.high_threshold,
+        old_roi.proposal_matcher.low_threshold,
+        old_roi.fg_bg_sampler.batch_size_per_image,
+        old_roi.fg_bg_sampler.positive_fraction,
+        old_roi.box_coder.weights,
+        old_roi.score_thresh,
+        old_roi.nms_thresh,
+        old_roi.detections_per_img,
     )
+    new_roi.to(device=device, dtype=dtype)
+    model.roi_heads = new_roi
 
 
 def run_structured_prune_fpn_only(

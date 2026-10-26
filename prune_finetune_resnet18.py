@@ -198,6 +198,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    flops_log_path = output_dir / "flops.jsonl"
 
     # Data
     data_sources = []
@@ -276,7 +277,7 @@ def main() -> None:
         logger.info(f"Fine-tuning for {epochs_each} epochs (lr={args.lr})...")
         for _ in range(epochs_each):
             global_epoch += 1
-            train_metrics = train_one_epoch(model, optimizer, train_loader, device, global_epoch, grad_clip=args.grad_clip)
+            train_metrics = train_one_epoch(model, optimizer, train_loader, device, global_epoch, grad_clip=args.grad_clip, flops_log_path=flops_log_path)
             val_metrics = evaluate_with_diagnostics(
                 model,
                 val_loader,
