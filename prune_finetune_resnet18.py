@@ -44,7 +44,8 @@ import torch.optim as optim
 from torch.nn.utils import prune
 from torch.utils.data import DataLoader, random_split
 
-from train import GraspDataset, collate_fn, train_one_epoch
+from train import GraspDataset, collate_fn, train_one_epoch, build_training_split, checkpoint_info
+from oriented_model import GRASP_FORMAT, load_training_weights
 from train_resnet_18 import evaluate_with_diagnostics, get_model, print_model_summary
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -189,6 +190,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--benchmark", action="store_true", help="Log inference time before/after (same device)")
 
+    parser.add_argument("--split_manifest", default=None, help="Reuse the original training holdout")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -213,11 +215,9 @@ def main() -> None:
         return
 
     dataset = GraspDataset(data_sources, target_size=(640, 480))
-    train_size = int(args.train_ratio * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
-    )
+    train_dataset, val_dataset, manifest = build_training_split(
+        dataset, args.train_ratio, output_dir, args.split_manifest, args.checkpoint)
+    checkpoint_metadata = checkpoint_info(manifest)
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn
     )
@@ -226,10 +226,11 @@ def main() -> None:
     )
 
     # Model + checkpoint
-    model = get_model(num_classes=2, freeze_backbone=args.freeze_backbone)
+    model = get_model(num_classes=2, freeze_backbone=args.freeze_backbone, pretrained=False)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-    model.load_state_dict(state, strict=True)
+    load_training_weights(model, ckpt)
+    checkpoint_metadata = checkpoint_info(manifest, ckpt)
     model.to(device)
 
     logger.info("=== Before pruning (loaded checkpoint) ===")
@@ -268,7 +269,7 @@ def main() -> None:
         elif args.scheduler == "step":
             lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
         elif args.scheduler == "plateau":
-            lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=True)
+            lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
         elif args.scheduler == "exponential":
             lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
         else:
@@ -298,6 +299,7 @@ def main() -> None:
 
         torch.save(
             {
+                **checkpoint_metadata,
                 "epoch": global_epoch,
                 "prune_round": r + 1,
                 "prune_amount_per_round": args.prune_amount,
@@ -316,6 +318,7 @@ def main() -> None:
 
     torch.save(
         {
+            **checkpoint_metadata,
             "epoch": global_epoch,
             "checkpoint_source": str(args.checkpoint),
             "prune_amount_per_round": args.prune_amount,

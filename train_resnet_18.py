@@ -14,7 +14,7 @@ import random
 
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 import numpy as np
 
 import matplotlib.pyplot as plt
@@ -33,6 +33,9 @@ from train import (
     print_model_info,
     OrientedFastRCNNPredictor,
     OrientedRoIHeads,
+    build_training_split,
+    checkpoint_info,
+    evaluate,
 )
 
 
@@ -40,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def get_model(num_classes: int, freeze_backbone: bool = False) -> torch.nn.Module:
+def get_model(num_classes: int, freeze_backbone: bool = False, pretrained: bool = True) -> torch.nn.Module:
     """
     Create Faster R-CNN model with ResNet-18 FPN backbone and oriented ROI head.
 
@@ -51,7 +54,7 @@ def get_model(num_classes: int, freeze_backbone: bool = False) -> torch.nn.Modul
     # Build the backbone with FPN on top of a pretrained ResNet-18.
     backbone = resnet_fpn_backbone(
         backbone_name="resnet18",
-        weights=ResNet18_Weights.IMAGENET1K_V1,
+        weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None,
         trainable_layers=3,
     )
 
@@ -74,6 +77,8 @@ def get_model(num_classes: int, freeze_backbone: bool = False) -> torch.nn.Modul
         old_roi.detections_per_img,
     )
     model.roi_heads = new_roi
+    from oriented_model import install_grasp_transform
+    install_grasp_transform(model)
 
     if freeze_backbone:
         # Freeze the full backbone feature extractor (ResNet + FPN),
@@ -128,99 +133,8 @@ def evaluate_with_diagnostics(
       A prediction is counted as correct only if IoU > iou_threshold
       AND |angle difference| <= angle_threshold (degrees) with any GT grasp.
     """
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
-    total_images = 0
-    correct_predictions = 0
-    images_with_any_pred = 0
-    images_with_pred_at_conf = 0
-    max_scores = []
-
-    with torch.no_grad():
-        for images, targets in data_loader:
-            images = [image.to(device) for image in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            # Compute validation loss
-            model.train()
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
-            total_loss += losses.item()
-            num_batches += 1
-
-            # Compute predictions
-            model.eval()
-            predictions = model(images)
-
-            for pred, target in zip(predictions, targets):
-                total_images += 1
-                scores = pred["scores"]
-                boxes = pred["boxes"]
-                angles = pred["angles"]
-
-                if scores.numel() > 0:
-                    images_with_any_pred += 1
-                    max_scores.append(float(scores.max().item()))
-                else:
-                    max_scores.append(0.0)
-
-                keep = scores >= confidence_threshold
-                kept_boxes = boxes[keep]
-                kept_angles = angles[keep]
-                kept_scores = scores[keep]
-
-                if kept_boxes.shape[0] == 0:
-                    continue
-                images_with_pred_at_conf += 1
-
-                k = min(top_k, kept_boxes.shape[0])
-                topk_indices = torch.topk(kept_scores, k=k).indices
-                candidate_boxes = kept_boxes[topk_indices].cpu().numpy()
-                candidate_angles = kept_angles[topk_indices].cpu().numpy()
-                gt_boxes = target["boxes"].cpu().numpy()
-                gt_angles = target["angles"].cpu().numpy()
-
-                image_success = False
-                for box, angle in zip(candidate_boxes, candidate_angles):
-                    pred_grasp = GraspRectangle.from_bbox(
-                        box[0], box[1], box[2], box[3], float(angle)
-                    )
-                    for gt_box, gt_angle in zip(gt_boxes, gt_angles):
-                        gt_grasp = GraspRectangle.from_bbox(
-                            gt_box[0], gt_box[1], gt_box[2], gt_box[3], float(gt_angle)
-                        )
-                        iou = pred_grasp.intersection_over_union(gt_grasp)
-                        angle_error = pred_grasp.angle_error(gt_grasp)
-                        if iou > iou_threshold and angle_error <= angle_threshold:
-                            image_success = True
-                            break
-                    if image_success:
-                        break
-
-                if image_success:
-                    correct_predictions += 1
-
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    accuracy = correct_predictions / total_images if total_images > 0 else 0.0
-    score_array = np.array(max_scores, dtype=np.float32) if max_scores else np.array([0.0], dtype=np.float32)
-
-    return {
-        "avg_loss": avg_loss,
-        "accuracy": accuracy,
-        "correct_predictions": correct_predictions,
-        "total_images": total_images,
-        "images_with_any_pred": images_with_any_pred,
-        "images_with_pred_at_conf": images_with_pred_at_conf,
-        "confidence_threshold": confidence_threshold,
-        "iou_threshold": iou_threshold,
-        "angle_threshold": angle_threshold,
-        "top_k": top_k,
-        "score_mean": float(score_array.mean()),
-        "score_median": float(np.median(score_array)),
-        "score_p90": float(np.percentile(score_array, 90)),
-        "score_max": float(score_array.max()),
-    }
+    return evaluate(model, data_loader, device, confidence_threshold,
+                    iou_threshold, angle_threshold, top_k)
 
 
 def print_model_summary(model: torch.nn.Module) -> None:
@@ -288,6 +202,8 @@ def main() -> None:
     parser.add_argument("--freeze_backbone", action="store_true",
                         help="Freeze the backbone feature extractor (only train RPN and ROI head)")
 
+    parser.add_argument('--split_manifest', type=str, default=None, help='Saved grouped train/validation split')
+    parser.add_argument('--eval_angle_threshold', type=float, default=30.0)
     args = parser.parse_args()
 
     # Set device
@@ -322,15 +238,9 @@ def main() -> None:
     # Create dataset
     dataset = GraspDataset(data_sources, target_size=(640, 480))
 
-    # Split dataset into train and validation
-    train_size = int(args.train_ratio * len(dataset))
-    val_size = len(dataset) - train_size
-
-    train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
+    train_dataset, val_dataset, manifest = build_training_split(
+        dataset, args.train_ratio, output_dir, args.split_manifest)
+    checkpoint_metadata = checkpoint_info(manifest)
 
     logger.info(f"Training samples: {len(train_dataset)}")
     logger.info(f"Validation samples: {len(val_dataset)}")
@@ -383,7 +293,7 @@ def main() -> None:
     elif args.scheduler == "cosine":
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=effective_epochs, eta_min=args.lr * 0.01)
     elif args.scheduler == "plateau":
-        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, verbose=True)
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
     elif args.scheduler == "exponential":
         lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
     else:
@@ -427,6 +337,7 @@ def main() -> None:
             device,
             confidence_threshold=args.eval_conf_threshold,
             iou_threshold=args.eval_iou_threshold,
+            angle_threshold=args.eval_angle_threshold,
             top_k=max(1, args.eval_top_k),
         )
         val_loss = val_metrics["avg_loss"]
@@ -459,11 +370,13 @@ def main() -> None:
         )
 
         # Save best model based on accuracy (or loss if you prefer)
-        if val_accuracy > best_val_accuracy:
+        if val_accuracy > best_val_accuracy or (val_accuracy == best_val_accuracy and val_loss < best_val_loss):
             best_val_accuracy = val_accuracy
             best_val_loss = val_loss
             torch.save(
                 {
+                    **checkpoint_metadata,
+                    "scheduler_state_dict": lr_scheduler.state_dict(),
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -480,6 +393,8 @@ def main() -> None:
             best_val_loss = val_loss
             torch.save(
                 {
+                    **checkpoint_metadata,
+                    "scheduler_state_dict": lr_scheduler.state_dict(),
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -495,6 +410,8 @@ def main() -> None:
         if (epoch + 1) % 10 == 0:
             torch.save(
                 {
+                    **checkpoint_metadata,
+                    "scheduler_state_dict": lr_scheduler.state_dict(),
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -507,6 +424,8 @@ def main() -> None:
     # Save final model
     torch.save(
         {
+            **checkpoint_metadata,
+            "scheduler_state_dict": lr_scheduler.state_dict(),
             "epoch": args.num_epochs,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -531,8 +450,8 @@ def main() -> None:
     # Plot accuracy
     ax2.plot(val_accuracies, label="Validation Accuracy", color="green")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("IoU-based Accuracy")
-    ax2.set_title("Validation IoU-based Accuracy")
+    ax2.set_ylabel("Rotated Grasp Success")
+    ax2.set_title("Validation Rotated Grasp Success")
     ax2.legend()
 
     plt.tight_layout()

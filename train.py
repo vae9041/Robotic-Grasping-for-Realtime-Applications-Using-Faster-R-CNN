@@ -9,12 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-import torchvision
-from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.roi_heads import RoIHeads
 import cv2
 import numpy as np
 import json
@@ -36,651 +32,111 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-class GraspRectangle:
-    """Represents an oriented grasp rectangle for IoU and angle comparisons."""
-
-    def __init__(self, center_x: float, center_y: float, width: float, height: float,
-                 angle: float = 0.0, format_type: str = 'jacquard'):
-        """
-        Initialize a grasp rectangle.
-
-        Args:
-            center_x: Center x coordinate
-            center_y: Center y coordinate
-            width: Width of grasp rectangle
-            height: Height of grasp rectangle
-            angle: Rotation angle in degrees (Jacquard) or radians (Cornell)
-            format_type: 'jacquard' or 'cornell'
-        """
-        self.center_x = center_x
-        self.center_y = center_y
-        self.width = width
-        self.height = height
-
-        if format_type == 'jacquard':
-            self.angle = math.radians(angle)  # Convert degrees to radians
-        else:
-            self.angle = angle  # Already in radians for Cornell
-
-        # Canonicalize to [0, pi) since a rectangle rotated by pi is identical.
-        self.angle = self.angle % math.pi
-
-    @classmethod
-    def from_bbox(cls, x_min: float, y_min: float, x_max: float, y_max: float, angle: float = 0.0):
-        """Create GraspRectangle from axis-aligned bounding box coordinates."""
-        center_x = (x_min + x_max) / 2
-        center_y = (y_min + y_max) / 2
-        width = x_max - x_min
-        height = y_max - y_min
-        return cls(center_x, center_y, width, height, angle, 'cornell')
-
-    @classmethod
-    def from_corners(cls, corners: np.ndarray, y_down: bool = True):
-        """
-        Build a GraspRectangle from 4 corner points in cyclic order.
-
-        Args:
-            corners: (4, 2) array of corner points ordered around the rectangle.
-            y_down: If True, the y-axis points downward (standard image convention
-                with origin top-left). If False, y points up.
-        """
-        assert corners.shape == (4, 2)
-        corners = corners.astype(np.float32)
-        center = corners.mean(axis=0)
-
-        # Use the first side (corner 0 -> corner 1) as the orientation reference.
-        # A rectangle is invariant to 180 degree flips, so we canonicalize later.
-        edge = corners[1] - corners[0]
-        ex, ey = float(edge[0]), float(edge[1])
-        if y_down:
-            ey = -ey
-        angle = math.atan2(ey, ex)
-        angle = angle % math.pi
-
-        # Width and height are the two distinct side lengths of the polygon.
-        edges = [corners[(i + 1) % 4] - corners[i] for i in range(4)]
-        lengths = [float(np.linalg.norm(e)) for e in edges]
-        # Keep width/height tied to the edge order used for the angle.
-        w = lengths[0]
-        h = lengths[1]
-        if w == 0:
-            w = 1.0
-        if h == 0:
-            h = 1.0
-
-        return cls(float(center[0]), float(center[1]), w, h, angle, 'cornell')
-
-    def to_corners(self) -> List[Tuple[float, float]]:
-        """Convert center representation to 4 corner points."""
-        # Half dimensions
-        w_half = self.width / 2.0
-        h_half = self.height / 2.0
-
-        # Corner offsets in local coordinate system
-        corners_local = [
-            (-w_half, -h_half),  # Bottom-left
-            (w_half, -h_half),   # Bottom-right
-            (w_half, h_half),    # Top-right
-            (-w_half, h_half)    # Top-left
-        ]
-
-        # Rotate and translate to global coordinates
-        cos_angle = math.cos(self.angle)
-        sin_angle = math.sin(self.angle)
-
-        corners_global = []
-        for dx, dy in corners_local:
-            # Rotate
-            x_rot = dx * cos_angle - dy * sin_angle
-            y_rot = dx * sin_angle + dy * cos_angle
-
-            # Translate
-            x_global = x_rot + self.center_x
-            y_global = y_rot + self.center_y
-
-            corners_global.append((x_global, y_global))
-
-        return corners_global
-
-    def to_bbox(self) -> Tuple[float, float, float, float]:
-        """Convert to axis-aligned bounding box (x_min, y_min, x_max, y_max)."""
-        corners = self.to_corners()
-        x_coords = [corner[0] for corner in corners]
-        y_coords = [corner[1] for corner in corners]
-
-        return (min(x_coords), min(y_coords), max(x_coords), max(y_coords))
-
-    def angle_error(self, other: 'GraspRectangle') -> float:
-        """
-        Return the absolute angle difference with another rectangle in degrees.
-        Rectangles are equivalent every 180 degrees, so the error is wrapped to [0, 90].
-        """
-        delta = (self.angle - other.angle) % math.pi
-        if delta > math.pi / 2.0:
-            delta = math.pi - delta
-        return math.degrees(delta)
-
-    def intersection_over_union(self, other: 'GraspRectangle') -> float:
-        """Calculate oriented-polygon IoU with another grasp rectangle."""
-        try:
-            corners1 = np.array(self.to_corners(), dtype=np.float32)
-            corners2 = np.array(other.to_corners(), dtype=np.float32)
-
-            intersection_area = cv2.intersectConvexConvex(corners1, corners2)[0]
-            if intersection_area <= 0:
-                return 0.0
-
-            area1 = self.width * self.height
-            area2 = other.width * other.height
-
-            union_area = area1 + area2 - intersection_area
-            if union_area <= 0:
-                return 0.0
-
-            return float(intersection_area / union_area)
-
-        except Exception:
-            # Fallback to bounding box IoU if cv2 fails for any reason.
-            bbox1 = self.to_bbox()
-            bbox2 = other.to_bbox()
-
-            x_left = max(bbox1[0], bbox2[0])
-            y_top = max(bbox1[1], bbox2[1])
-            x_right = min(bbox1[2], bbox2[2])
-            y_bottom = min(bbox1[3], bbox2[3])
-
-            if x_right < x_left or y_bottom < y_top:
-                return 0.0
-
-            intersection_area = (x_right - x_left) * (y_bottom - y_top)
-            area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
-            area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
-            union_area = area1 + area2 - intersection_area
-
-            if union_area <= 0:
-                return 0.0
-
-            return float(intersection_area / union_area)
+from copy import copy
+from torch.utils.data import Subset
+from grasp_geometry import GraspRectangle, letterbox, transform_grasps
+from grasp_data import (discover_samples, load_grasps, create_split, validate_split,
+                        read_split, select_indices, split_digest)
+from grasp_metrics import score_image, summarize
+from oriented_model import (GRASP_FORMAT, OrientedFastRCNNPredictor, OrientedRoIHeads,
+                            install_grasp_transform, load_training_weights)
 
 
 class GraspDataset(Dataset):
-    """Dataset class for grasp detection that handles multiple data sources"""
-    
-    def __init__(self, data_sources: List[Dict], transform=None, target_size=(640, 480), max_grasps_per_image=300):
-        """
-        Args:
-            data_sources: List of dictionaries with dataset information
-            transform: Optional transforms to apply to images
-            target_size: Target image size (width, height)
-            max_grasps_per_image: Cap the number of ground-truth grasps per image to avoid RPN OOM
-        """
+    """Positive oriented grasps; no image stretching or negative-as-positive targets."""
+    def __init__(self, data_sources, transform=None, target_size=(640, 480), max_grasps_per_image=300):
         self.data_sources = data_sources
         self.transform = transform
         self.target_size = target_size
         self.max_grasps_per_image = max_grasps_per_image
-        self.samples = []
-        
-        # Load all samples from different sources
-        self._load_samples()
-        
-        logger.info(f"Loaded {len(self.samples)} total samples from {len(data_sources)} data sources")
-    
-    def _load_samples(self):
-        """Load samples from all data sources"""
-        for source in self.data_sources:
-            source_type = source['type']
-            source_path = source['path']
-            
-            if source_type == 'augmented_cornell':
-                self._load_augmented_cornell(source_path)
-            elif source_type == 'original_cornell':
-                self._load_original_cornell(source_path)
-            elif source_type == 'original_jacquard':
-                self._load_original_jacquard(source_path)
-            else:
-                logger.warning(f"Unknown source type: {source_type}")
-    
-    def _load_augmented_cornell(self, augmented_path):
-        """Load augmented Cornell dataset"""
-        augmented_dir = Path(augmented_path)
-        rgb_dir = augmented_dir / 'rgb'
-        depth_dir = augmented_dir / 'depth'
-        ann_dir = augmented_dir / 'annotations'
-        
-        if not all(d.exists() for d in [rgb_dir, depth_dir, ann_dir]):
-            logger.warning(f"Augmented Cornell directory structure incomplete: {augmented_path}")
-            return
-        
-        for ann_file in ann_dir.glob('*.json'):
-            base_name = ann_file.stem
-            rgb_file = rgb_dir / f"{base_name}.png"
-            depth_file = depth_dir / f"{base_name}.png"
-            
-            if rgb_file.exists() and depth_file.exists():
-                self.samples.append({
-                    'rgb_path': str(rgb_file),
-                    'depth_path': str(depth_file),
-                    'annotation_path': str(ann_file),
-                    'source': 'augmented_cornell',
-                    'format': 'json'
-                })
-        
-        logger.info(f"Loaded {len([s for s in self.samples if s['source'] == 'augmented_cornell'])} augmented Cornell samples")
-    
-    def _load_original_cornell(self, cornell_path):
-        """Load original Cornell dataset"""
-        cornell_dir = Path(cornell_path)
-        
-        for folder in sorted(cornell_dir.iterdir()):
-            if folder.is_dir() and folder.name != 'backgrounds':
-                for file in folder.glob('pcd*.txt'):
-                    if 'cpos' not in file.name and 'cneg' not in file.name:
-                        base_name = file.stem
-                        rgb_file = folder / f"{base_name}r.png"
-                        depth_file = folder / f"{base_name}d.tiff"
-                        pos_file = folder / f"{base_name}cpos.txt"
-                        neg_file = folder / f"{base_name}cneg.txt"
-                        
-                        if all(f.exists() for f in [rgb_file, depth_file, pos_file]):
-                            self.samples.append({
-                                'rgb_path': str(rgb_file),
-                                'depth_path': str(depth_file),
-                                'pos_grasps_path': str(pos_file),
-                                'neg_grasps_path': str(neg_file) if neg_file.exists() else None,
-                                'source': 'original_cornell',
-                                'format': 'cornell'
-                            })
-        
-        logger.info(f"Loaded {len([s for s in self.samples if s['source'] == 'original_cornell'])} original Cornell samples")
-    
-    def _load_original_jacquard(self, jacquard_path):
-        """Load original Jacquard dataset"""
-        jacquard_dir = Path(jacquard_path)
-        
-        for folder in sorted(jacquard_dir.iterdir()):
-            if folder.is_dir():
-                for subfolder in folder.iterdir():
-                    if subfolder.is_dir():
-                        for rgb_file in subfolder.glob('*_RGB.png'):
-                            base_name = rgb_file.name.replace('_RGB.png', '')
-                            depth_file = subfolder / f"{base_name}_perfect_depth.tiff"
-                            grasps_file = subfolder / f"{base_name}_grasps.txt"
-                            
-                            if all(f.exists() for f in [rgb_file, depth_file, grasps_file]):
-                                self.samples.append({
-                                    'rgb_path': str(rgb_file),
-                                    'depth_path': str(depth_file),
-                                    'grasps_path': str(grasps_file),
-                                    'source': 'original_jacquard',
-                                    'format': 'jacquard'
-                                })
-        
-        logger.info(f"Loaded {len([s for s in self.samples if s['source'] == 'original_jacquard'])} original Jacquard samples")
-    
-    def _load_grasps_from_json(self, json_path):
-        """Load grasps from augmented dataset JSON format."""
-        with open(json_path, 'r') as f:
-            data = json.load(f)
+        self.samples = discover_samples(data_sources)
+        logger.info('Loaded %d images', len(self.samples))
 
-        boxes = []
-        labels = []
-        angles = []
-
-        for grasp in data['grasps']:
-            # Convert grasp to oriented rectangle and take its AABB.
-            corners = np.array(grasp['corners'])
-            rect = GraspRectangle.from_corners(corners, y_down=True)
-            x_min, y_min, x_max, y_max = rect.to_bbox()
-
-            # Ensure valid bounding box
-            if x_max > x_min and y_max > y_min:
-                boxes.append([x_min, y_min, x_max, y_max])
-                angles.append(rect.angle)
-                # Use quality score to determine label (1 for good grasp, 0 for background)
-                labels.append(1 if grasp['quality'] > 0.5 else 1)  # All grasps are positive for now
-
-        return boxes, labels, angles
-    
-    def _load_grasps_from_cornell(self, pos_path, neg_path=None):
-        """Load grasps from Cornell format files and return AABBs + oriented angles."""
-        boxes = []
-        labels = []
-        angles = []
-
-        def _process_cornell_file(path, is_positive):
-            if not os.path.exists(path):
-                return
-            with open(path, 'r') as f:
-                lines = f.readlines()
-                for i in range(0, len(lines), 4):
-                    if i + 3 < len(lines):
-                        corners = []
-                        for j in range(4):
-                            x, y = map(float, lines[i + j].strip().split())
-                            corners.append([x, y])
-                        corners = np.array(corners)
-
-                        rect = GraspRectangle.from_corners(corners, y_down=True)
-                        x_min, y_min, x_max, y_max = rect.to_bbox()
-
-                        if x_max > x_min and y_max > y_min:
-                            boxes.append([x_min, y_min, x_max, y_max])
-                            angles.append(rect.angle)
-                            labels.append(1 if is_positive else 1)  # Treat all as positives for now
-
-        _process_cornell_file(pos_path, is_positive=True)
-        _process_cornell_file(neg_path, is_positive=False)
-
-        return boxes, labels, angles
-    
-    def _load_grasps_from_jacquard(self, grasps_path):
-        """Load grasps from Jacquard format file and return AABBs + oriented angles."""
-        boxes = []
-        labels = []
-        angles = []
-
-        with open(grasps_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split(';')
-                if len(parts) >= 5:
-                    x, y, theta, w, h = map(float, parts[:5])
-
-                    # Build the oriented rectangle and extract its AABB for the detector target.
-                    rect = GraspRectangle(x, y, w, h, theta, format_type='jacquard')
-                    x_min, y_min, x_max, y_max = rect.to_bbox()
-
-                    if x_max > x_min and y_max > y_min:
-                        boxes.append([x_min, y_min, x_max, y_max])
-                        angles.append(rect.angle)
-                        labels.append(1)  # All Jacquard grasps are positive
-
-        return boxes, labels, angles
-    
     def __len__(self):
         return len(self.samples)
-    
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
-
-        # Load RGB image
-        rgb_image = cv2.imread(sample['rgb_path'])
-        rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
-
-        # Resize image to target size
-        rgb_image = cv2.resize(rgb_image, self.target_size)
-
-        # Load grasps based on format
-        if sample['format'] == 'json':
-            boxes, labels, angles = self._load_grasps_from_json(sample['annotation_path'])
-        elif sample['format'] == 'cornell':
-            boxes, labels, angles = self._load_grasps_from_cornell(
-                sample['pos_grasps_path'],
-                sample.get('neg_grasps_path')
-            )
-        elif sample['format'] == 'jacquard':
-            boxes, labels, angles = self._load_grasps_from_jacquard(sample['grasps_path'])
-        else:
-            boxes, labels, angles = [], [], []
-
-        # Scale boxes to resized image (angles are invariant to scale).
-        if len(boxes) > 0:
-            # Get original image size for scaling
-            original_image = cv2.imread(sample['rgb_path'])
-            orig_h, orig_w = original_image.shape[:2]
-            scale_x = self.target_size[0] / orig_w
-            scale_y = self.target_size[1] / orig_h
-
-            # Scale boxes
-            scaled_boxes = []
-            for box in boxes:
-                x_min, y_min, x_max, y_max = box
-                scaled_box = [
-                    x_min * scale_x,
-                    y_min * scale_y,
-                    x_max * scale_x,
-                    y_max * scale_y
-                ]
-                # Clamp to image bounds
-                scaled_box[0] = max(0, min(scaled_box[0], self.target_size[0] - 1))
-                scaled_box[1] = max(0, min(scaled_box[1], self.target_size[1] - 1))
-                scaled_box[2] = max(scaled_box[0] + 1, min(scaled_box[2], self.target_size[0]))
-                scaled_box[3] = max(scaled_box[1] + 1, min(scaled_box[3], self.target_size[1]))
-                scaled_boxes.append(scaled_box)
-            boxes = scaled_boxes
-
-            # Cap the number of ground-truth boxes to avoid RPN box_iou OOM on
-            # samples with an extreme number of grasps (some Jacquard files have >1000).
-            if len(boxes) > self.max_grasps_per_image:
-                rng = np.random.default_rng(idx)
-                keep = rng.choice(len(boxes), self.max_grasps_per_image, replace=False)
-                keep = keep.tolist()
-                boxes = [boxes[i] for i in keep]
-                labels = [labels[i] for i in keep]
-                angles = [angles[i] for i in keep]
-
-        # Convert to tensors
-        if len(boxes) == 0:
-            # Handle case with no grasps
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
-            labels = torch.zeros((0,), dtype=torch.int64)
-            angles = torch.zeros((0,), dtype=torch.float32)
-        else:
-            boxes = torch.tensor(boxes, dtype=torch.float32)
-            labels = torch.tensor(labels, dtype=torch.int64)
-            angles = torch.tensor(angles, dtype=torch.float32)
-
-        # Apply transforms if specified
-        if self.transform:
-            rgb_image = self.transform(rgb_image)
-        else:
-            # Default transform: convert to tensor and normalize
-            rgb_image = torch.from_numpy(rgb_image).permute(2, 0, 1).float() / 255.0
-
-        # Create target dictionary
-        target = {
-            'boxes': boxes,
-            'labels': labels,
-            'angles': angles,
-        }
-        
-        return rgb_image, target
+        image = cv2.imread(sample['rgb_path'])
+        if image is None:
+            raise ValueError(f"Cannot read RGB image: {sample['rgb_path']}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image, scale, offset = letterbox(image, self.target_size)
+        grasps = transform_grasps(load_grasps(sample), scale, offset)
+        if self.max_grasps_per_image and len(grasps) > self.max_grasps_per_image:
+            keep = np.random.default_rng(idx).choice(len(grasps), self.max_grasps_per_image, replace=False)
+            grasps = grasps[keep]
+        boxes = np.asarray([GraspRectangle.from_array(g).to_bbox() for g in grasps], dtype=np.float32).reshape(-1, 4)
+        if len(boxes):
+            boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, self.target_size[0])
+            boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, self.target_size[1])
+            valid = (boxes[:, 2:] > boxes[:, :2]).all(axis=1)
+            boxes, grasps = boxes[valid], grasps[valid]
+        target = dict(boxes=torch.from_numpy(boxes), grasps=torch.from_numpy(grasps),
+                      angles=torch.from_numpy(grasps[:, 4].copy()),
+                      labels=torch.ones(len(grasps), dtype=torch.int64))
+        image = self.transform(image) if self.transform else torch.from_numpy(image).permute(2, 0, 1).float() / 255.
+        return image, target
 
 
-class OrientedFastRCNNPredictor(nn.Module):
-    """Faster R-CNN box predictor extended with a continuous angle head."""
-
-    def __init__(self, in_features: int, num_classes: int):
-        super().__init__()
-        self.cls_score = nn.Linear(in_features, num_classes)
-        self.bbox_pred = nn.Linear(in_features, num_classes * 4)
-        # Encode angle as 2-channel (sin, cos) to avoid wrap-around discontinuities.
-        # Small MLP to give the angle branch enough capacity.
-        self.angle_pred = nn.Sequential(
-            nn.Linear(in_features, 512),
-            nn.ReLU(),
-            nn.Linear(512, 2)
-        )
-
-    def forward(self, x):
-        if x.dim() == 4:
-            assert x.shape[2:] == (1, 1), f"Expected last two dims to be (1,1), got {x.shape}"
-        x = x.flatten(start_dim=1)
-        class_logits = self.cls_score(x)
-        bbox_regression = self.bbox_pred(x)
-        angle = F.normalize(self.angle_pred(x), p=2, dim=1, eps=1e-6)
-        return class_logits, bbox_regression, angle
-
-
-class OrientedRoIHeads(RoIHeads):
-    """ROI head that adds an angle regression branch to Faster R-CNN."""
-    angle_loss_weight = 1.0
-
-    def forward(self, features, proposals, image_shapes, targets=None):
-        """
-        Override to compute loss_angle on sin/cos encoded ground-truth angles.
-        In training returns (result, losses); in evaluation returns result.
-        """
-        if self.training:
-            if targets is None:
-                raise ValueError("targets should not be None in training")
-            proposals, matched_idxs, labels, regression_targets = self.select_training_samples(proposals, targets)
-        else:
-            labels = None
-            regression_targets = None
-            matched_idxs = None
-
-        # Extract box features
-        box_features = self.box_roi_pool(features, proposals, image_shapes)
-        box_features = self.box_head(box_features)
-        class_logits, box_regression, angle_pred = self.box_predictor(box_features)
-
-        result: List[Dict[str, torch.Tensor]] = []
-        losses = {}
-
-        if self.training:
-            if labels is None or regression_targets is None or matched_idxs is None:
-                raise ValueError("Training samples not generated")
-
-            # Standard classification and bbox regression losses
-            labels_all = torch.cat(labels, dim=0)
-            regression_targets_all = torch.cat(regression_targets, dim=0)
-            classification_loss = F.cross_entropy(class_logits, labels_all)
-
-            sampled_pos_inds = torch.where(labels_all > 0)[0]
-            num_total = labels_all.numel()
-            N, num_classes = class_logits.shape
-            box_regression_per_class = box_regression.reshape(N, num_classes, 4)
-            labels_pos = labels_all[sampled_pos_inds]
-            box_loss = F.smooth_l1_loss(
-                box_regression_per_class[sampled_pos_inds, labels_pos],
-                regression_targets_all[sampled_pos_inds],
-                beta=1.0 / 9.0,
-                reduction="sum",
-            ) / max(1, num_total)
-
-            losses["loss_classifier"] = classification_loss
-            losses["loss_box_reg"] = box_loss
-
-            # Angle regression loss on foreground proposals only.
-            if sampled_pos_inds.numel() > 0:
-                offset = 0
-                pos_angle_preds = []
-                pos_angle_targets = []
-                for img_idx, (props, matched_idx, lbl, tgt) in enumerate(zip(proposals, matched_idxs, labels, targets)):
-                    img_foreground = torch.where(lbl > 0)[0]
-                    if img_foreground.numel() == 0:
-                        offset += len(props)
-                        continue
-                    gt_indices = matched_idx[img_foreground]
-                    gt_angles = tgt["angles"][gt_indices]
-                    # Avoid in-place modification; keep canonical [0, pi)
-                    gt_angles = gt_angles % math.pi
-                    pos_angle_targets.append(torch.stack([torch.sin(gt_angles), torch.cos(gt_angles)], dim=1))
-                    pos_angle_preds.append(angle_pred[offset + img_foreground])
-                    offset += len(props)
-
-                if pos_angle_targets:
-                    angle_pred_pos = torch.cat(pos_angle_preds, dim=0)
-                    angle_target_pos = torch.cat(pos_angle_targets, dim=0)
-                    # Pi-periodic angle loss: 1 - (v·t)^2  ==  sin^2(delta).
-                    # Invariant to v -> -v, which is the correct 180-degree symmetry for a grasp.
-                    dot = (angle_pred_pos * angle_target_pos).sum(dim=1).clamp(-1.0, 1.0)
-                    losses["loss_angle"] = (1.0 - dot * dot).mean() * self.angle_loss_weight
-                else:
-                    losses["loss_angle"] = angle_pred.sum() * 0.0
-            else:
-                losses["loss_angle"] = angle_pred.sum() * 0.0
-
-            return result, losses
-
-        # Evaluation path
-        boxes, scores, labels_out, angles_out = self.postprocess_detections(
-            class_logits, box_regression, angle_pred, proposals, image_shapes
-        )
-        num_images = len(boxes)
-        for i in range(num_images):
-            result.append(
-                {
-                    "boxes": boxes[i],
-                    "labels": labels_out[i],
-                    "scores": scores[i],
-                    "angles": angles_out[i],
-                }
-            )
-        return result, losses
-
-    def postprocess_detections(
-        self,
-        class_logits: torch.Tensor,
-        box_regression: torch.Tensor,
-        angle_pred: torch.Tensor,
-        proposals: List[torch.Tensor],
-        image_shapes: List[Tuple[int, int]],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """Decode detections and add the predicted angle for each kept box (foreground only)."""
-        device = class_logits.device
-        N, num_classes = class_logits.shape
-        num_fg = num_classes - 1
-        boxes_per_image = [len(boxes_in_image) for boxes_in_image in proposals]
-
-        pred_scores = F.softmax(class_logits, -1)[:, 1:]  # drop background
-        pred_boxes = self.box_coder.decode(box_regression, proposals)  # [N, num_classes*4]
-        pred_boxes = pred_boxes.reshape(N, num_classes, 4)[:, 1:].reshape(N, num_fg * 4)
-
-        pred_boxes_list = pred_boxes.split(boxes_per_image, 0)
-        pred_scores_list = pred_scores.split(boxes_per_image, 0)
-        pred_labels_list = [torch.arange(1, num_classes, device=device).reshape(1, -1).expand(s.shape[0], -1) for s in pred_scores_list]
-        angle_pred_list = angle_pred.split(boxes_per_image, 0)
-
-        all_boxes = []
-        all_scores = []
-        all_labels = []
-        all_angles = []
-
-        for boxes, scores, labels, angles, image_shape in zip(
-            pred_boxes_list, pred_scores_list, pred_labels_list, angle_pred_list, image_shapes
-        ):
-            n = boxes.shape[0]
-            boxes = boxes.reshape(n, num_fg, 4).reshape(-1, 4)
-            # Create one row per (box, foreground class) for multi-class NMS filtering
-            scores = scores.reshape(-1)
-            labels = labels.reshape(-1)
-            angles = angles.unsqueeze(1).expand(-1, num_fg, -1).reshape(-1, 2)
-
-            # Remove low scoring boxes
-            inds = torch.where(scores > self.score_thresh)[0]
-            boxes, scores, labels, angles = boxes[inds], scores[inds], labels[inds], angles[inds]
-
-            # Remove empty boxes
-            keep = torchvision.ops.remove_small_boxes(boxes, min_size=1e-2)
-            boxes, scores, labels, angles = boxes[keep], scores[keep], labels[keep], angles[keep]
-
-            # Non-maximum suppression (per class)
-            keep = torchvision.ops.batched_nms(boxes, scores, labels, self.nms_thresh)
-            keep = keep[: self.detections_per_img]
-            boxes, scores, labels, angles = boxes[keep], scores[keep], labels[keep], angles[keep]
-
-            # Decode angle from (sin, cos) representation
-            decoded_angles = torch.atan2(angles[:, 0], angles[:, 1])
-            decoded_angles = decoded_angles % math.pi
-
-            all_boxes.append(boxes)
-            all_scores.append(scores)
-            all_labels.append(labels)
-            all_angles.append(decoded_angles)
-
-        return all_boxes, all_scores, all_labels, all_angles
+def build_training_split(dataset, train_ratio, output_dir, manifest_path=None, resume=None):
+    """Split original identities first, then attach only training-derived augmentations."""
+    output_path = Path(output_dir) / 'dataset_split.json'
+    checkpoint_split = None
+    if resume:
+        checkpoint_split = torch.load(resume, map_location='cpu', weights_only=False).get('split_manifest')
+    if manifest_path:
+        manifest = read_split(manifest_path)
+    elif checkpoint_split:
+        manifest = checkpoint_split
+    elif output_path.exists():
+        manifest = read_split(output_path)
+    else:
+        manifest = create_split(dataset.samples, train_ratio)
+    validate_split(manifest, dataset.samples)
+    if checkpoint_split and split_digest(checkpoint_split) != split_digest(manifest):
+        raise ValueError('Resume checkpoint and requested split differ')
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(manifest, indent=2) + '\n')
+    train_indices = select_indices(dataset.samples, manifest, 'train')
+    val_indices = select_indices(dataset.samples, manifest, 'val')
+    validation_dataset = copy(dataset)
+    validation_dataset.max_grasps_per_image = None
+    logger.info('Saved split to %s; validation contains original images only', output_path)
+    return Subset(dataset, train_indices), Subset(validation_dataset, val_indices), manifest
 
 
-def get_model(num_classes, freeze_backbone=False, angle_loss_weight=1.0, nms_thresh=None, score_thresh=None):
+def checkpoint_info(manifest, parent_checkpoint=None):
+    provenance = 'grouped_original_split'
+    if parent_checkpoint is not None:
+        provenance = parent_checkpoint.get('holdout_provenance',
+                     'grouped_original_split' if parent_checkpoint.get('grasp_format') == GRASP_FORMAT
+                     else 'unverified_legacy_warm_start')
+    return dict(grasp_format=GRASP_FORMAT, split_manifest=manifest,
+                split_digest=split_digest(manifest), holdout_provenance=provenance)
+
+
+def get_model(num_classes, freeze_backbone=False, angle_loss_weight=1.0, nms_thresh=None, score_thresh=None, pretrained=True):
     """Create Faster R-CNN model with ResNet50 FPN backbone and oriented ROI head.
 
     Args:
         num_classes: Number of classes (including background)
         freeze_backbone: If True, freeze the backbone feature extractor
     """
-    # Load pre-trained model
-    model = fasterrcnn_resnet50_fpn(pretrained=True)
+    if pretrained:
+        model = fasterrcnn_resnet50_fpn(weights="DEFAULT", weights_backbone=None)
+    else:
+        # The torchvision convenience factory uses trainable BatchNorm when no
+        # weights are requested. Build the SAME FrozenBatchNorm backbone as the
+        # pretrained detector, without downloading weights during checkpoint load.
+        from torchvision.models.detection import FasterRCNN
+        from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+        from torchvision.ops.misc import FrozenBatchNorm2d
+        backbone = resnet_fpn_backbone(backbone_name='resnet50', weights=None, trainable_layers=3)
+        model = FasterRCNN(backbone, num_classes=num_classes)
+        for module in model.modules():
+            if isinstance(module, FrozenBatchNorm2d):
+                module.eps = 0.0  # matches torchvision's pretrained COCO_V1 detector
 
     # Get number of input features for the classifier
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -702,6 +158,7 @@ def get_model(num_classes, freeze_backbone=False, angle_loss_weight=1.0, nms_thr
     )
     new_roi.angle_loss_weight = angle_loss_weight
     model.roi_heads = new_roi
+    install_grasp_transform(model)
 
     # Freeze backbone if requested
     if freeze_backbone:
@@ -865,97 +322,31 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=50,
     return epoch_metrics
 
 
-def evaluate(model, data_loader, device, confidence_threshold: float = 0.5, iou_threshold: float = 0.25, angle_threshold: float = 30.0):
-    """
-    Evaluate the model using oriented-grasp success rate.
-    For each image, the best predicted grasp must satisfy IoU > iou_threshold
-    AND |angle difference| <= angle_threshold (degrees) with a GT grasp to count.
-    """
-    model.eval()  # Set to eval mode for predictions
-
-    total_loss = 0
-    num_batches = 0
-    correct_predictions = 0
-    total_images = 0
-
+def evaluate(model, data_loader, device, confidence_threshold=0.5, iou_threshold=0.25,
+             angle_threshold=30.0, top_k=1):
+    """True rotated geometry and any-valid-GT matching, shared with standalone eval."""
+    records, losses = [], []
+    model.eval()
     with torch.no_grad():
-        for images, targets in tqdm(data_loader, desc="Evaluating"):
-            # Move to device
+        for images, targets in tqdm(data_loader, desc='Evaluating'):
             images = [image.to(device) for image in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            # Get loss (temporarily set to train mode)
+            targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
             model.train()
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
-            total_loss += losses.item()
-            num_batches += 1
-
-            # Get predictions (set back to eval mode)
+            # Freeze batch statistics during validation-loss computation.
+            for module in model.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+            losses.append(float(sum(model(images, targets).values()).item()))
             model.eval()
             predictions = model(images)
-
-            # Process each image in the batch
-            for i, (pred, target) in enumerate(zip(predictions, targets)):
-                total_images += 1
-
-                # Filter predictions by confidence
-                keep_indices = pred['scores'] >= confidence_threshold
-                pred_boxes = pred['boxes'][keep_indices].cpu().numpy()
-                pred_angles = pred['angles'][keep_indices].cpu().numpy()
-                pred_scores = pred['scores'][keep_indices].cpu().numpy()
-
-                # Skip if no confident predictions
-                if len(pred_boxes) == 0:
-                    continue
-
-                # Select best prediction (highest confidence)
-                best_pred_idx = int(np.argmax(pred_scores))
-                best_pred_box = pred_boxes[best_pred_idx]
-                best_pred_angle = float(pred_angles[best_pred_idx])
-
-                # Convert to oriented GraspRectangle
-                best_pred_grasp = GraspRectangle.from_bbox(
-                    best_pred_box[0], best_pred_box[1],
-                    best_pred_box[2], best_pred_box[3], best_pred_angle
-                )
-
-                # Get ground truth grasps
-                gt_boxes = target['boxes'].cpu().numpy()
-                gt_angles = target['angles'].cpu().numpy()
-
-                # Check if best prediction has sufficient AABB IoU and angle with any GT grasp
-                image_success = False
-                aabb_pred = GraspRectangle.from_bbox(
-                    best_pred_box[0], best_pred_box[1],
-                    best_pred_box[2], best_pred_box[3], 0.0
-                )
-                for gt_box, gt_angle in zip(gt_boxes, gt_angles):
-                    aabb_gt = GraspRectangle.from_bbox(
-                        gt_box[0], gt_box[1], gt_box[2], gt_box[3], 0.0
-                    )
-                    gt_grasp = GraspRectangle.from_bbox(
-                        gt_box[0], gt_box[1], gt_box[2], gt_box[3], float(gt_angle)
-                    )
-                    iou = aabb_pred.intersection_over_union(aabb_gt)
-                    angle_error = best_pred_grasp.angle_error(gt_grasp)
-                    if iou > iou_threshold and angle_error <= angle_threshold:
-                        image_success = True
-                        break
-
-                if image_success:
-                    correct_predictions += 1
-
-    # Calculate metrics
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0
-    accuracy = correct_predictions / total_images if total_images > 0 else 0.0
-
-    return {
-        'avg_loss': avg_loss,
-        'accuracy': accuracy,
-        'correct_predictions': correct_predictions,
-        'total_images': total_images
-    }
+            for prediction, target in zip(predictions, targets):
+                prediction = {key: value.cpu().numpy() for key, value in prediction.items()}
+                target = {key: value.cpu().numpy() for key, value in target.items()}
+                records.append(score_image(prediction, target, confidence_threshold,
+                                           iou_threshold, angle_threshold, top_k, compute_per_grasp=False))
+    metrics = summarize(records, confidence_threshold, iou_threshold, angle_threshold, top_k)
+    metrics['avg_loss'] = float(np.mean(losses)) if losses else 0.
+    return metrics
 
 
 def main():
@@ -976,7 +367,7 @@ def main():
                        help='Weight decay')
     
     # Learning rate scheduler options
-    parser.add_argument('--scheduler', type=str, default='step', 
+    parser.add_argument('--scheduler', type=str, default=None,
                        choices=['step', 'cosine', 'plateau', 'exponential'],
                        help='Learning rate scheduler type')
     parser.add_argument('--step_size', type=int, default=20,
@@ -985,13 +376,13 @@ def main():
                        help='Gamma for StepLR and ExponentialLR schedulers')
     
     # Optimizer options
-    parser.add_argument('--optimizer', type=str, default='sgd',
+    parser.add_argument('--optimizer', type=str, default=None,
                        choices=['sgd', 'adam', 'adamw'],
                        help='Optimizer type')
     parser.add_argument('--momentum', type=float, default=0.9,
                        help='Momentum for SGD optimizer')
     parser.add_argument('--angle_loss_weight', type=float, default=1.0,
-                       help='Weight for the angle regression MSE loss')
+                       help='Weight for the pi-periodic angle loss')
     parser.add_argument('--nms_thresh', type=float, default=None,
                        help='Override NMS threshold for oriented ROI head (default: keep pretrained value)')
     parser.add_argument('--score_thresh', type=float, default=None,
@@ -1005,11 +396,12 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=0.0,
                        help='Gradient clipping threshold (0 = no clipping)')
     parser.add_argument('--finetune_angle_head', action='store_true',
-                       help='Freeze all parameters except the angle head and train only it')
+                       help='Train only the new angle and grasp-dimension heads')
     parser.add_argument('--unfreeze_roi_head', action='store_true',
                        help='Freeze backbone/RPN and fine-tune the ROI box head and all predictor heads')
     parser.add_argument('--unfreeze_all', action='store_true',
                        help='Unfreeze all parameters and reset optimizer for end-to-end fine-tuning')
+    parser.add_argument('--split_manifest', type=str, default=None, help='Saved grouped train/validation split')
     parser.add_argument('--resume', type=str, default=None,
                        help='Path to checkpoint to resume from')
     
@@ -1027,6 +419,10 @@ def main():
                        help='Freeze the backbone feature extractor (only train RPN and ROI head)')
     
     args = parser.parse_args()
+    if (args.finetune_angle_head or args.unfreeze_roi_head) and not args.resume:
+        parser.error('Fine-tuning requires --resume with a trained detector checkpoint')
+    if args.num_epochs < 1 or args.batch_size < 1:
+        parser.error('num_epochs and batch_size must be positive')
     
     # Set device
     if args.device == 'auto':
@@ -1071,15 +467,20 @@ def main():
     # Create dataset
     dataset = GraspDataset(data_sources, target_size=(640, 480))
     
-    # Split dataset into train and validation
-    train_size = int(args.train_ratio * len(dataset))
-    val_size = len(dataset) - train_size
-    
-    train_dataset, val_dataset = random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
+    train_dataset, val_dataset, manifest = build_training_split(
+        dataset, args.train_ratio, output_dir, args.split_manifest, args.resume)
+    parent_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False) if args.resume else None
+    args.optimizer = args.optimizer or (parent_checkpoint or {}).get('optimizer_name', 'sgd')
+    args.scheduler = args.scheduler or (parent_checkpoint or {}).get('scheduler_name', 'step')
+    continuing = args.resume and not (args.finetune_angle_head or args.unfreeze_roi_head or args.unfreeze_all)
+    if continuing:
+        for name in ('optimizer', 'scheduler'):
+            saved = parent_checkpoint.get(name + '_name')
+            if saved and saved != getattr(args, name):
+                raise ValueError(f'Resume requires the saved {name} {saved}; use a fine-tuning flag to change it')
+    checkpoint_metadata = checkpoint_info(manifest, parent_checkpoint)
+    checkpoint_metadata.update(optimizer_name=args.optimizer, scheduler_name=args.scheduler)
+
     logger.info(f"Training samples: {len(train_dataset)}")
     logger.info(f"Validation samples: {len(val_dataset)}")
     
@@ -1103,16 +504,18 @@ def main():
     # Create model
     model = get_model(num_classes=2, freeze_backbone=args.freeze_backbone,
                       angle_loss_weight=args.angle_loss_weight,
-                      nms_thresh=args.nms_thresh, score_thresh=args.score_thresh)  # Background + grasp
+                      nms_thresh=args.nms_thresh, score_thresh=args.score_thresh,
+                      pretrained=not bool(args.resume))  # Background + grasp
     model.to(device)
     
     # Optional: fine-tune only the angle head or the full ROI head
     if args.finetune_angle_head:
-        logger.info("Freezing all parameters except the angle head")
+        logger.info("Training angle and oriented-dimension heads; detector weights frozen")
         for p in model.parameters():
             p.requires_grad = False
-        for p in model.roi_heads.box_predictor.angle_pred.parameters():
-            p.requires_grad = True
+        for head in (model.roi_heads.box_predictor.angle_pred, model.roi_heads.box_predictor.grasp_pred):
+            for p in head.parameters():
+                p.requires_grad = True
     elif args.unfreeze_roi_head:
         logger.info("Freezing backbone/RPN, unfreezing ROI box head and all predictor heads")
         for p in model.parameters():
@@ -1125,6 +528,14 @@ def main():
         logger.info("Unfreezing all parameters for end-to-end fine-tuning")
         for p in model.parameters():
             p.requires_grad = True
+    if continuing and 'trainable_parameter_names' in parent_checkpoint:
+        saved_names = set(parent_checkpoint['trainable_parameter_names'])
+        if not saved_names <= set(dict(model.named_parameters())):
+            raise ValueError('Saved trainable parameter names differ from the model architecture')
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = name in saved_names
+    checkpoint_metadata['trainable_parameter_names'] = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad]
     
     # Print model information
     if args.show_model_details:
@@ -1148,9 +559,9 @@ def main():
     if args.scheduler == 'step':
         lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
     elif args.scheduler == 'cosine':
-        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr*0.01)
+        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.num_epochs - args.warmup_epochs), eta_min=args.lr*0.01)
     elif args.scheduler == 'plateau':
-        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     elif args.scheduler == 'exponential':
         lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
     else:
@@ -1166,11 +577,12 @@ def main():
     
     if args.resume:
         logger.info(f"Resuming from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        # strict=False allows resuming into the new (wider) angle-pred MLP.
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        checkpoint = parent_checkpoint
+        load_training_weights(model, checkpoint, allow_legacy=(args.finetune_angle_head or args.unfreeze_roi_head or args.unfreeze_all))
         if not (args.finetune_angle_head or args.unfreeze_roi_head or args.unfreeze_all):
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch']
             best_val_accuracy = checkpoint.get('val_accuracy', 0.0)
             best_val_loss = checkpoint.get('val_loss', float('inf'))
@@ -1184,6 +596,9 @@ def main():
     logger.info("Starting training...")
     
     for epoch in range(start_epoch, args.num_epochs):
+        if epoch < args.warmup_epochs:
+            for group in optimizer.param_groups:
+                group['lr'] = args.lr * (epoch + 1) / args.warmup_epochs
         # Train
         train_metrics = train_one_epoch(model, optimizer, train_loader, device, epoch + 1, grad_clip=args.grad_clip, flops_log_path=flops_log_path)
         train_loss = train_metrics['total_loss']
@@ -1197,7 +612,9 @@ def main():
         val_accuracies.append(val_accuracy)
         
         # Update learning rate
-        if args.scheduler == 'plateau':
+        if epoch < args.warmup_epochs:
+            pass
+        elif args.scheduler == 'plateau':
             lr_scheduler.step(val_loss)  # ReduceLROnPlateau needs the metric
         else:
             lr_scheduler.step()  # Other schedulers don't need arguments
@@ -1205,12 +622,16 @@ def main():
         logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
         logger.info(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         logger.info(f"Val Accuracy: {val_accuracy:.4f} ({val_metrics['correct_predictions']}/{val_metrics['total_images']})")
+        logger.info('AABB success: %.4f; angle success given AABB: %.4f',
+                    val_metrics['aabb_accuracy'], val_metrics['angle_success_given_aabb'])
         
         # Save best model based on accuracy (or loss if you prefer)
-        if val_accuracy > best_val_accuracy:
+        if val_accuracy > best_val_accuracy or (val_accuracy == best_val_accuracy and val_loss < best_val_loss):
             best_val_accuracy = val_accuracy
             best_val_loss = val_loss
             torch.save({
+                **checkpoint_metadata,
+                "scheduler_state_dict": lr_scheduler.state_dict(),
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -1224,6 +645,8 @@ def main():
         elif val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({
+                **checkpoint_metadata,
+                "scheduler_state_dict": lr_scheduler.state_dict(),
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -1236,6 +659,8 @@ def main():
         # Save latest model
         if (epoch + 1) % 10 == 0:
             torch.save({
+                **checkpoint_metadata,
+                "scheduler_state_dict": lr_scheduler.state_dict(),
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -1245,6 +670,8 @@ def main():
     
     # Save final model
     torch.save({
+        **checkpoint_metadata,
+        "scheduler_state_dict": lr_scheduler.state_dict(),
         'epoch': args.num_epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -1267,8 +694,8 @@ def main():
     # Plot accuracy
     ax2.plot(val_accuracies, label='Validation Accuracy', color='green')
     ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('IoU-based Accuracy')
-    ax2.set_title('Validation IoU-based Accuracy')
+    ax2.set_ylabel('Rotated Grasp Success')
+    ax2.set_title('Validation Rotated Grasp Success')
     ax2.legend()
     
     plt.tight_layout()

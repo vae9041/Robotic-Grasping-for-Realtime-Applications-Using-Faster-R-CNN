@@ -126,7 +126,7 @@ def run_small_test():
                 # Save test result
                 save_augmented_data(
                     Path(output_dir), "test_cornell", 0,
-                    aug_rgb, aug_depth, aug_grasps, 'cornell'
+                    aug_rgb, aug_depth, aug_grasps, 'cornell', source_id=sample['sample_id']
                 )
                 
                 print("Cornell test completed successfully!")

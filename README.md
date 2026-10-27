@@ -2,7 +2,7 @@
 
 **Vincent Eloy** and **Ferat Sahin** — Rochester Institute of Technology, Rochester, NY, USA.
 
-PyTorch codebase for **two-stage grasp detection** with Faster R-CNN (torchvision): **ResNet-50 FPN**, **ResNet-18 FPN**, and a **structured-pruned ResNet-18** variant aimed at low-latency deployment. Grasp hypotheses are **axis-aligned bounding boxes** with confidence scores; annotations from Cornell and Jacquard are converted to AABBs at **640×480**, RGB normalized to **[0, 1]**.
+PyTorch codebase for **two-stage grasp detection** with Faster R-CNN (torchvision): **ResNet-50 FPN**, **ResNet-18 FPN**, and a **structured-pruned ResNet-18** variant aimed at low-latency deployment. The angle branch predicts **oriented grasps** `(cx, cy, opening, jaw_size, theta)` alongside AABBs used for proposals and detection. Images are uniformly scaled and padded to **640×480**, with RGB in **[0, 1]**. The model retains Faster R-CNN’s usual internal short-side resolution.
 
 This repository contains **training, evaluation, offline augmentation, RealSense live inference, structured pruning, and latency/FLOP profiling scripts**. Robot-side **ROS 2**, **MoveIt 2**, **UR5e**, and **Intel RealSense D435** integration described in the paper is a separate deployment stack; here the focus is the **vision model and benchmarks**.
 
@@ -15,7 +15,7 @@ This repository contains **training, evaluation, offline augmentation, RealSense
 | Inference (NVIDIA RTX 6000 GPU) | **13.2 ms** forward time reported for the full detector |
 | Structured-pruned ResNet-18 | Competitive with full R-18 (see eval logs) | **7.66 ms** inference; FPN-focused pruning in-repo |
 
-Evaluation protocol for Cornell/Jacquard uses **confidence 0.5** and **IoU 0.25** for image-level success unless you override flags.
+Historical accuracy figures above describe earlier AABB-based experiments and are **not rotated-grasp results**. Corrected evaluation requires **polygon IoU > 0.25 and angle error ≤ 30°**, modulo 180°, against the same successful ground-truth grasp. By default it evaluates the top prediction at confidence 0.5 on the saved original-image holdout.
 
 ---
 
@@ -42,101 +42,127 @@ Weights (`.pth`) are **not** tracked in git by default; see `.gitignore`. Place 
 
 ## Environment setup
 
-```bash
-python -m venv faster_rcnn_env
-source faster_rcnn_env/bin/activate   # Linux/macOS
-pip install -r requirements.txt
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124   # example; pick URL for your CUDA
-```
-
-Verify:
+Use Python 3.10 or newer. Install a compatible torch/torchvision pair for your GPU, or their CPU builds for local testing:
 
 ```bash
+python3 -m venv faster_rcnn_env
+source faster_rcnn_env/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch torchvision
+python -m pip install -r requirements.txt
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
----
+Training and model smoke tests have been exercised with torch 2.14.1+cpu / torchvision 0.29.1+cpu. Torch is installed separately from `requirements.txt` so you can choose the correct CUDA build.
 
-## Dataset layout
+## Dataset layout and saved holdout
 
-Download **Cornell** and **Jacquard** into the project (or symlink). Expected layout (names match defaults in `train.py`):
+Run the commands below from this repository directory. Put or symlink extracted datasets at `cornell_dataset/` and `jacquard_dataset/`, or pass their actual roots to the scripts.
 
+Cornell discovery uses `*cpos.txt` and matching `*r.png` files, including nested numbered folders. Neither a point-cloud text file nor depth is required for RGB training. Unsuccessful `cneg` annotations are excluded. Offline augmentation accepts depth PNG/TIFF when present, or an empty depth image when absent.
+
+Jacquard discovery uses matching `*_grasps.txt` / `*_RGB.png` pairs. All views of the same object remain in one partition. Annotations use clockwise image-coordinate degrees, converted internally to radians; opening and jaw size retain their edge meanings.
+
+**Create the split before augmenting:**
+
+```bash
+python prepare_split.py \
+  --cornell_path ./cornell_dataset \
+  --jacquard_path ./jacquard_dataset \
+  --train_ratio 0.9 \
+  --output ./dataset_split.json
+
+python data_augmentation.py \
+  --cornell_path ./cornell_dataset \
+  --split_manifest ./dataset_split.json \
+  --output_path ./augmented_dataset_v2 \
+  --num_augmentations 5
 ```
-Vince_Fasterrcnn/
-├── cornell_dataset/
-├── augmented_dataset/          # produced by data_augmentation.py
-├── jacquard_dataset/
-├── train.py
-└── ...
-```
 
----
+Only training identities are augmented. The training loader also enforces this restriction, even if an augmentation directory contains validation-derived images. Old augmentations lack corrected geometry/provenance and must be regenerated into a new directory. Validation always uses original images and all their valid positive grasps, without the training-only grasp-count cap.
+
+If you omit `--split_manifest` in training, the script creates and saves a grouped split from original images, or reuses the existing output directory’s manifest. The manifest is also embedded in each checkpoint. Cornell is split by original image; Jacquard by object. Splits are deterministic and stratified by dataset, so the image ratio for Jacquard can differ slightly from the requested group ratio.
 
 ## Training
 
-### ResNet-50 (default `train.py`)
+### ResNet-50
 
 ```bash
-source faster_rcnn_env/bin/activate
 python train.py \
-  --augmented_cornell_path ./augmented_dataset \
   --cornell_path ./cornell_dataset \
   --jacquard_path ./jacquard_dataset \
-  --optimizer adamw \
-  --scheduler cosine \
-  --lr 0.0005 \
-  --weight_decay 0.01 \
-  --batch_size 8 \
-  --num_epochs 30 \
-  --train_ratio 0.9 \
-  --output_dir ./models_adamw_cosine \
-  --show_model_details
+  --augmented_cornell_path ./augmented_dataset_v2 \
+  --split_manifest ./dataset_split.json \
+  --optimizer adamw --scheduler cosine \
+  --lr 0.0005 --weight_decay 0.01 \
+  --batch_size 4 --num_epochs 30 --device cuda \
+  --output_dir ./models_resnet50_oriented
 ```
 
 ### ResNet-18
 
 ```bash
 python train_resnet_18.py \
-  --augmented_cornell_path ./augmented_dataset \
   --cornell_path ./cornell_dataset \
   --jacquard_path ./jacquard_dataset \
+  --augmented_cornell_path ./augmented_dataset_v2 \
+  --split_manifest ./dataset_split.json \
+  --batch_size 4 --num_epochs 50 --device cuda \
   --output_dir ./models_resnet18_v2
 ```
 
-Use `python train.py --help` / `python train_resnet_18.py --help` for full argument lists (optimizers, schedulers, `--freeze_backbone`, etc.).
+Use `--device cpu` for CPU execution. Both backbones share the oriented geometry head, pi-periodic angle loss, preprocessing, and polygon evaluator. Checkpoints include geometry-version and split metadata. `final_model.pth`, best checkpoints, `dataset_split.json`, and `training_curves.png` are written to the output directory.
 
----
+### Warm-start an older ResNet-50 detector
+
+Old AABB-only and pre-fix angle checkpoints cannot directly provide corrected rotated grasps. Their detector weights can initialize training, while the angle and dimension heads are reset:
+
+```bash
+python train.py \
+  --resume /path/to/old_resnet50_checkpoint.pth \
+  --finetune_angle_head \
+  --cornell_path ./cornell_dataset \
+  --jacquard_path ./jacquard_dataset \
+  --augmented_cornell_path ./augmented_dataset_v2 \
+  --split_manifest ./dataset_split.json \
+  --optimizer adamw --lr 0.0001 --scheduler cosine \
+  --num_epochs 10 --device cuda \
+  --output_dir ./models_resnet50_grasp_heads
+```
+
+`--finetune_angle_head` trains both angle and actual grasp-dimension heads while preserving detector weights. A later run with `--resume ... --unfreeze_all` starts joint fine-tuning with a fresh optimizer. Resume without a fine-tuning flag requires a corrected checkpoint and restores the optimizer, scheduler, and original split.
+
+An older checkpoint may already have seen images in a newly created holdout. Such warm starts are automatically marked as **unverified legacy pretraining** in evaluation output. To measure an unbiased held-out result, train from generic pretrained weights using the saved split, or establish an independently untouched evaluation set. Historical AABB accuracy does not establish rotated-grasp accuracy.
 
 ## Evaluation
 
-**Cornell (ResNet-50):**
+The evaluators use the checkpoint’s saved validation identities automatically. An explicit manifest must match the embedded training split. They report AABB success, angle success conditional on AABB localization, and true rotated-grasp success separately.
 
 ```bash
 python eval_cornell.py \
-  --model_path ./path/to/best_model.pth \
+  --model_path ./models_resnet50_oriented/best_model.pth \
   --cornell_path ./cornell_dataset \
-  --confidence_threshold 0.5 \
-  --iou_threshold 0.25 \
-  --output_dir ./evaluation_results
-```
+  --confidence_threshold 0.5 --iou_threshold 0.25 --angle_threshold 30 \
+  --output_dir ./cornell_oriented_evaluation --visualize
 
-**Jacquard (ResNet-50):**
-
-```bash
 python eval_jacquard.py \
-  --model_path ./path/to/best_model.pth \
+  --model_path ./models_resnet50_oriented/best_model.pth \
   --jacquard_path ./jacquard_dataset \
-  --confidence_threshold 0.5 \
-  --iou_threshold 0.25 \
-  --output_dir ./jacquard_evaluation
+  --confidence_threshold 0.5 --iou_threshold 0.25 --angle_threshold 30 \
+  --output_dir ./jacquard_oriented_evaluation
 ```
 
-**ResNet-18** (same metrics; swap script):
+For ResNet-18, use `eval_cornell_res18.py` / `eval_jacquard_res18.py`; they use the same evaluator and support corrected structured-pruned checkpoints. `--top_k` defaults to 1. Raising it changes the evaluation protocol. `--allow_full_dataset` is an explicit diagnostic mode that labels results as including training images, not a holdout score.
+
+Metrics are saved to `evaluation_results.json`; visualization draws actual rotated polygons. An angle and IoU must pass for the **same** ground-truth annotation, and any qualifying annotation can match. Per-grasp matching is one-to-one and ordered by prediction confidence.
+
+## Verification
 
 ```bash
-python eval_cornell_res18.py --model_path ./path/to/resnet18.pth --cornell_path ./cornell_dataset --output_dir ./evaluation_results_res18
-python eval_jacquard_res18.py --model_path ./path/to/resnet18.pth --jacquard_path ./jacquard_dataset --output_dir ./jacquard_eval_res18
+python -m unittest discover -s tests -v
 ```
+
+The suite uses synthetic annotations and real CPU forward/backward passes for both backbones. It requires no datasets, camera, CUDA, or pretrained downloads. It checks corner and angle conventions, polygon matching, augmentation alignment, negative filtering, grouped holdouts, geometry encoding, transforms, checkpoint migration, and evaluator selection. Dataset-level accuracy still requires actual training and evaluation.
 
 ---
 
@@ -198,7 +224,9 @@ Requires `pyrealsense2` and a connected RealSense camera.
 
 - **Detector**: torchvision **Faster R-CNN** with **ResNet-50 + FPN** or **ResNet-18 + FPN**.
 - **Head**: `FastRCNNPredictor` with **2 classes** (background, grasp).
-- **Input**: RGB **640×480**, float tensor in **[0, 1]** (CHW), passed as a **list** of tensors per image.
+- **Input**: aspect-preserving RGB **640×480** canvas in **[0, 1]** (CHW), passed as a **list** of tensors.
+- **Outputs**: AABBs for detection plus `grasps` of shape `(N, 5)` containing `(cx, cy, opening, jaw_size, theta_radians)` in the caller image’s coordinates. Angles are clockwise in image coordinates and periodic modulo pi.
+- **Losses**: classification, AABB regression, RPN losses, actual grasp geometry regression, and pi-periodic angle loss.
 
 ResNet-50 checkpoint size is on the order of **41M parameters**; ResNet-18 is smaller; structured pruning reduces parameters and estimated FLOPs (see `profile_faster_rcnn_compute.py`).
 
@@ -206,7 +234,7 @@ ResNet-50 checkpoint size is on the order of **41M parameters**; ResNet-18 is sm
 
 ## Results 
 
-Reported best table rows from internal evaluation logs (ResNet-50, AdamW + cosine-style training):
+Historical AABB-based results from internal evaluation logs (ResNet-50, AdamW + cosine-style training); these do not measure the corrected rotated-grasp criterion:
 
 | Dataset | Image-level success | Notes |
 |---------|---------------------|--------|

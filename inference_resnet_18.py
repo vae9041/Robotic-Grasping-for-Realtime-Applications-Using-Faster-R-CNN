@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import List
 
+from grasp_geometry import GraspRectangle, letterbox
+from oriented_model import load_training_weights
 import cv2
 import torch
 
@@ -68,27 +70,27 @@ def preprocess_bgr_to_chw(
 ) -> torch.Tensor:
     """RGB resize -> (3, H, W) float [0,1] on device."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+    rgb, _, _ = letterbox(rgb, (width, height))
     t = torch.from_numpy(rgb).permute(2, 0, 1).to(dtype=dtype, device=device)
     t = t / 255.0
     return t
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
-    model = get_model(num_classes=2, freeze_backbone=False)
+    model = get_model(num_classes=2, freeze_backbone=False, pretrained=False)
     try:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(checkpoint_path, map_location=device)
 
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
+        load_training_weights(model, ckpt)
         logger.info(
             "Loaded model_state_dict"
             + (f" (epoch {ckpt.get('epoch', '?')})" if "epoch" in ckpt else "")
         )
     else:
-        model.load_state_dict(ckpt)
+        load_training_weights(model, ckpt)
 
     model.to(device)
     model.eval()
@@ -192,15 +194,17 @@ def main() -> None:
 
         if save_dir is not None:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            rgb_r = cv2.resize(rgb, (args.width, args.height), interpolation=cv2.INTER_LINEAR)
+            rgb_r, _, _ = letterbox(rgb, (args.width, args.height))
             vis = cv2.cvtColor(rgb_r, cv2.COLOR_RGB2BGR)
             boxes = pred["boxes"].detach().float().cpu().numpy()
+            grasps = pred["grasps"].detach().float().cpu().numpy()
             scores = pred["scores"].detach().float().cpu().numpy()
-            for box, sc in zip(boxes, scores):
+            for box, grasp, sc in zip(boxes, grasps, scores):
                 if sc < args.conf_threshold:
                     continue
                 x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                corners = GraspRectangle.from_array(grasp).to_corners().astype("int32")
+                cv2.polylines(vis, [corners], True, (0, 255, 0), 2)
                 cv2.putText(
                     vis, f"{sc:.2f}", (x1, max(0, y1 - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,

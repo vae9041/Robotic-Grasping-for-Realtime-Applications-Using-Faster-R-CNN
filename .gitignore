@@ -62,3 +62,7 @@ cornell_evaluation*/
 trained_models97.06pct/
 *_out*/
 *_inference*/
+
+# Saved dataset partitions (also embedded in checkpoints)
+dataset_split*.json
+augmented_dataset_v*/

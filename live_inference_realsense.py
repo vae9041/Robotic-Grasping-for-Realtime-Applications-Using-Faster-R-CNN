@@ -9,6 +9,8 @@ import time
 import logging
 import argparse
 import numpy as np
+from train import get_model as get_oriented_model
+from oriented_model import load_training_weights
 import cv2
 import torch
 import torch.nn as nn
@@ -164,7 +166,7 @@ class LiveGraspDetector:
     
     def __init__(self, model_path: str, device: str = 'cuda', confidence_threshold: float = 0.5):
         """Initialize the live grasp detector."""
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if device == 'auto' else device)
         self.confidence_threshold = confidence_threshold
         
         # Load model
@@ -180,15 +182,12 @@ class LiveGraspDetector:
     def _load_model(self, model_path: str):
         """Load the trained model."""
         # Create model architecture
-        model = fasterrcnn_resnet50_fpn(pretrained=False, num_classes=2)
+        model = get_oriented_model(num_classes=2, pretrained=False)
         
         # Load trained weights
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-        
+        load_training_weights(model, checkpoint)
+
         model.to(self.device)
         logger.info(f"Model loaded from {model_path}")
         return model
@@ -226,35 +225,13 @@ class LiveGraspDetector:
     
     def _post_process_predictions(self, prediction: Dict) -> List[GraspRectangle]:
         """Post-process model predictions to grasp rectangles."""
-        boxes = prediction['boxes'].cpu().numpy()
-        scores = prediction['scores'].cpu().numpy()
-        
-        # Filter by confidence threshold
-        valid_indices = scores >= self.confidence_threshold
-        boxes = boxes[valid_indices]
-        scores = scores[valid_indices]
-        
-        # Apply NMS
-        if len(boxes) > 0:
-            keep_indices = nms(
-                torch.tensor(boxes), 
-                torch.tensor(scores), 
-                iou_threshold=0.3
-            ).numpy()
-            
-            boxes = boxes[keep_indices]
-            scores = scores[keep_indices]
-        
-        # Convert to grasp rectangles
-        grasps = []
-        for box, score in zip(boxes, scores):
-            grasp = GraspRectangle.from_bbox(
-                box[0], box[1], box[2], box[3], confidence=score
-            )
-            grasps.append(grasp)
-        
-        return grasps
-    
+        values = prediction['grasps'].detach().cpu().numpy()
+        scores = prediction['scores'].detach().cpu().numpy()
+        # The detector has already performed NMS; preserve its angle/geometry pairing.
+        return [GraspRectangle(float(g[0]), float(g[1]), float(g[2]), float(g[3]),
+                               angle=float(g[4]), confidence=float(score))
+                for g, score in zip(values, scores) if score >= self.confidence_threshold]
+
     def get_performance_stats(self) -> Dict[str, float]:
         """Get performance statistics."""
         if not self.inference_times:

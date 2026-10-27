@@ -66,7 +66,8 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, TwoMLPHe
 from torchvision.models.detection.rpn import RPNHead
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from train import GraspDataset, collate_fn, train_one_epoch
+from train import GraspDataset, collate_fn, train_one_epoch, build_training_split, checkpoint_info
+from oriented_model import GRASP_FORMAT, load_training_weights
 from train_resnet_18 import evaluate_with_diagnostics, get_model, print_model_summary
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -350,6 +351,8 @@ def load_structured_pruned_state_dict(
     """
     Load a checkpoint saved by this script. Rebuilds `_BackboneWithUniformFPN` when metadata says so.
     """
+    if checkpoint.get('grasp_format') != GRASP_FORMAT:
+        raise ValueError('Retrain old checkpoints with corrected oriented geometry before structured evaluation')
     meta = checkpoint.get("structured_pruning_meta")
     sd = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
     if not isinstance(sd, dict):
@@ -612,6 +615,7 @@ def main() -> None:
     parser.add_argument("--benchmark_runs", type=int, default=30)
     parser.add_argument("--benchmark_warmup", type=int, default=10)
 
+    parser.add_argument("--split_manifest", default=None, help="Reuse the original training holdout")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -624,13 +628,15 @@ def main() -> None:
 
     logger.info(f"Device: {device}. Prune scope: {args.prune_scope}.")
     logger.info("Loading model…")
-    model = get_model(num_classes=2, freeze_backbone=args.freeze_backbone)
+    model = get_model(num_classes=2, freeze_backbone=args.freeze_backbone, pretrained=False)
     try:
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(args.checkpoint, map_location=device)
     state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-    model.load_state_dict(state, strict=True)
+    load_training_weights(model, ckpt)
+    checkpoint_metadata = {key: ckpt[key] for key in ('grasp_format', 'split_manifest', 'split_digest')}
+    checkpoint_metadata["holdout_provenance"] = ckpt.get("holdout_provenance", "grouped_original_split")
     model.to(device)
 
     total0, train0 = count_params(model)
@@ -740,11 +746,12 @@ def main() -> None:
         if os.path.exists(args.jacquard_path):
             data_sources.append({"type": "original_jacquard", "path": args.jacquard_path})
         if not data_sources:
-            logger.error("No dataset paths for fine-tuning; skipping.")
+            raise ValueError("Dataset paths are required for fine-tuning")
         else:
             dataset = GraspDataset(data_sources, target_size=(640, 480))
-            n_train = int(args.train_ratio * len(dataset))
-            train_ds, val_ds = random_split(dataset, [n_train, len(dataset) - n_train], generator=torch.Generator().manual_seed(42))
+            train_ds, val_ds, manifest = build_training_split(
+                dataset, args.train_ratio, output_dir, args.split_manifest, args.checkpoint)
+            checkpoint_metadata = checkpoint_info(manifest, ckpt)
             train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn)
             val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
@@ -771,6 +778,7 @@ def main() -> None:
     total2, train2 = count_params(model)
     torch.save(
         {
+            **checkpoint_metadata,
             "model_state_dict": model.state_dict(),
             "checkpoint_source": str(args.checkpoint),
             "prune_scope": args.prune_scope,

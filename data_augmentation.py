@@ -1,598 +1,205 @@
-"""
-Data Augmentation for Grasp Detection using Cornell and Jacquard Datasets
-Implements random crops, zooms, and rotations with proper grasp annotation transformations.
-"""
+"""Cornell augmentation with one similarity transform for RGB, depth and grasps."""
+import argparse
+from dataclasses import dataclass
+import json
+import math
+from pathlib import Path
+import random
 
-import os
 import cv2
 import numpy as np
-import random
-from typing import List, Tuple, Dict, Union
-import json
-import argparse
-from pathlib import Path
-import shutil
-from dataclasses import dataclass
-import math
 
-# Try to import albumentations, fallback to OpenCV if not available
-try:
-    import albumentations as A
-    ALBUMENTATIONS_AVAILABLE = True
-except ImportError:
-    print("Warning: albumentations not available. Using OpenCV-based augmentations.")
-    ALBUMENTATIONS_AVAILABLE = False
+from grasp_data import discover_samples, load_grasps, read_split
+from grasp_geometry import GraspRectangle as GeometryRectangle
 
 
 @dataclass
 class AugmentationConfig:
-    """Configuration for data augmentation parameters"""
-    rotation_limit: int = 45
+    rotation_limit: float = 45
     crop_ratio_min: float = 0.7
     crop_ratio_max: float = 1.0
     zoom_min: float = 0.8
     zoom_max: float = 1.2
     num_augmentations: int = 5
-    output_size: Tuple[int, int] = (640, 480)
+    output_size: tuple = (640, 480)
     brightness_limit: float = 0.2
     contrast_limit: float = 0.2
 
 
 class GraspRectangle:
-    """Represents a grasp rectangle with center, angle, and dimensions"""
-    
-    def __init__(self, center_x: float, center_y: float, angle: float, width: float, height: float, quality: float = 1.0):
-        self.center_x = center_x
-        self.center_y = center_y
-        self.angle = angle  # in degrees
-        self.width = width
-        self.height = height
-        self.quality = quality
-    
-    def get_corners(self) -> np.ndarray:
-        """Get the four corner points of the grasp rectangle"""
-        # Convert angle to radians
-        angle_rad = np.radians(self.angle)
-        
-        # Half dimensions
-        hw = self.width / 2
-        hh = self.height / 2
-        
-        # Corner points relative to center (before rotation)
-        corners = np.array([
-            [-hw, -hh],
-            [hw, -hh],
-            [hw, hh],
-            [-hw, hh]
-        ])
-        
-        # Rotation matrix
-        cos_a = np.cos(angle_rad)
-        sin_a = np.sin(angle_rad)
-        rotation_matrix = np.array([
-            [cos_a, -sin_a],
-            [sin_a, cos_a]
-        ])
-        
-        # Rotate corners
-        rotated_corners = np.dot(corners, rotation_matrix.T)
-        
-        # Translate to center position
-        rotated_corners[:, 0] += self.center_x
-        rotated_corners[:, 1] += self.center_y
-        
-        return rotated_corners
-    
+    """Compatibility wrapper: augmentation angles are clockwise image degrees."""
+    def __init__(self, center_x, center_y, angle, width, height, quality=1.0):
+        self.center_x, self.center_y = float(center_x), float(center_y)
+        self.angle = float(angle) % 180
+        self.width, self.height, self.quality = float(width), float(height), quality
+
+    def get_corners(self):
+        return GeometryRectangle(self.center_x, self.center_y, self.width,
+                                 self.height, self.angle).to_corners()
+
     @classmethod
-    def from_corners(cls, corners: np.ndarray, quality: float = 1.0):
-        """Create GraspRectangle from four corner points"""
-        # Calculate center
-        center_x = np.mean(corners[:, 0])
-        center_y = np.mean(corners[:, 1])
-        
-        # Calculate width and height from the actual edge order
-        width = np.linalg.norm(corners[1] - corners[0])
-        height = np.linalg.norm(corners[2] - corners[1])
-        
-        # Calculate angle using y-down image convention and canonicalize to [0, 180)
-        dx = corners[1, 0] - corners[0, 0]
-        dy = corners[0, 1] - corners[1, 1]  # flip y for image coordinates
-        angle = np.degrees(np.arctan2(dy, dx)) % 180
-        
-        return cls(center_x, center_y, angle, width, height, quality)
-    
-    def is_valid(self, image_width: int, image_height: int, min_size: int = 10) -> bool:
-        """Check if grasp rectangle is valid (within bounds and reasonable size)"""
+    def from_corners(cls, corners, quality=1.0):
+        rectangle = GeometryRectangle.from_corners(corners)
+        return cls(rectangle.center_x, rectangle.center_y, math.degrees(rectangle.angle),
+                   rectangle.width, rectangle.height, quality)
+
+    def is_valid(self, image_width, image_height, min_size=1):
         corners = self.get_corners()
-        
-        # Check if all corners are within image bounds
-        if (np.any(corners[:, 0] < 0) or np.any(corners[:, 0] >= image_width) or
-            np.any(corners[:, 1] < 0) or np.any(corners[:, 1] >= image_height)):
-            return False
-        
-        # Check minimum size
-        if self.width < min_size or self.height < min_size:
-            return False
-        
-        return True
+        return bool(np.isfinite(corners).all() and min(self.width, self.height) >= min_size
+                    and (corners >= 0).all()
+                    and (corners[:, 0] < image_width).all()
+                    and (corners[:, 1] < image_height).all())
 
 
 class CornellDataset:
-    """Handler for Cornell Grasp Dataset"""
-    
-    def __init__(self, dataset_path: str):
+    def __init__(self, dataset_path):
         self.dataset_path = Path(dataset_path)
-        self.samples = self._load_samples()
-    
-    def _load_samples(self) -> List[Dict]:
-        """Load all samples from Cornell dataset"""
-        samples = []
-        
-        for folder in sorted(self.dataset_path.iterdir()):
-            if folder.is_dir() and folder.name != 'backgrounds':
-                for file in folder.glob('pcd*.txt'):
-                    if 'cpos' not in file.name and 'cneg' not in file.name:
-                        base_name = file.stem
-                        rgb_file = folder / f"{base_name}r.png"
-                        depth_file = folder / f"{base_name}d.tiff"
-                        pos_file = folder / f"{base_name}cpos.txt"
-                        neg_file = folder / f"{base_name}cneg.txt"
-                        
-                        if all(f.exists() for f in [rgb_file, depth_file, pos_file]):
-                            samples.append({
-                                'rgb_path': str(rgb_file),
-                                'depth_path': str(depth_file),
-                                'pos_grasps_path': str(pos_file),
-                                'neg_grasps_path': str(neg_file) if neg_file.exists() else None,
-                                'dataset': 'cornell'
-                            })
-        
-        return samples
-    
-    def load_grasps(self, pos_path: str, neg_path: str = None) -> List[GraspRectangle]:
-        """Load grasp rectangles from Cornell format files"""
-        grasps = []
-        
-        # Load positive grasps
-        if os.path.exists(pos_path):
-            with open(pos_path, 'r') as f:
-                lines = f.readlines()
-                for i in range(0, len(lines), 4):
-                    if i + 3 < len(lines):
-                        corners = []
-                        for j in range(4):
-                            x, y = map(float, lines[i + j].strip().split())
-                            corners.append([x, y])
-                        corners = np.array(corners)
-                        grasp = GraspRectangle.from_corners(corners, quality=1.0)
-                        grasps.append(grasp)
-        
-        # Load negative grasps
-        if neg_path and os.path.exists(neg_path):
-            with open(neg_path, 'r') as f:
-                lines = f.readlines()
-                for i in range(0, len(lines), 4):
-                    if i + 3 < len(lines):
-                        corners = []
-                        for j in range(4):
-                            x, y = map(float, lines[i + j].strip().split())
-                            corners.append([x, y])
-                        corners = np.array(corners)
-                        grasp = GraspRectangle.from_corners(corners, quality=0.0)
-                        grasps.append(grasp)
-        
-        return grasps
+        self.samples = discover_samples([dict(type='original_cornell', path=dataset_path)])
+        for sample in self.samples:
+            pos = Path(sample['pos_grasps_path'])
+            base = pos.name.removesuffix('cpos.txt')
+            sample['depth_path'] = next((str(pos.with_name(base + suffix))
+                                         for suffix in ('d.png', 'd.tiff', 'd.tif')
+                                         if pos.with_name(base + suffix).exists()), None)
+
+    def load_grasps(self, pos_path, neg_path=None):
+        # Unsuccessful annotations are deliberately excluded from positive targets.
+        grasps = load_grasps(dict(format='cornell', pos_grasps_path=pos_path))
+        return [GraspRectangle(g[0], g[1], math.degrees(g[4]), g[2], g[3]) for g in grasps]
 
 
 class JacquardDataset:
-    """Handler for Jacquard Grasp Dataset"""
-    
-    def __init__(self, dataset_path: str):
-        self.dataset_path = Path(dataset_path)
-        self.samples = self._load_samples()
-    
-    def _load_samples(self) -> List[Dict]:
-        """Load all samples from Jacquard dataset"""
-        samples = []
-        
-        for folder in sorted(self.dataset_path.iterdir()):
-            if folder.is_dir():
-                for subfolder in folder.iterdir():
-                    if subfolder.is_dir():
-                        for rgb_file in subfolder.glob('*_RGB.png'):
-                            base_name = rgb_file.name.replace('_RGB.png', '')
-                            depth_file = subfolder / f"{base_name}_perfect_depth.tiff"
-                            grasps_file = subfolder / f"{base_name}_grasps.txt"
-                            
-                            if all(f.exists() for f in [rgb_file, depth_file, grasps_file]):
-                                samples.append({
-                                    'rgb_path': str(rgb_file),
-                                    'depth_path': str(depth_file),
-                                    'grasps_path': str(grasps_file),
-                                    'dataset': 'jacquard'
-                                })
-        
-        return samples
-    
-    def load_grasps(self, grasps_path: str) -> List[GraspRectangle]:
-        """Load grasp rectangles from Jacquard format file"""
-        grasps = []
-        
-        with open(grasps_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split(';')
-                if len(parts) >= 5:
-                    x, y, theta, w, h = map(float, parts[:5])
-                    # Convert theta from degrees to our format
-                    grasp = GraspRectangle(x, y, theta, w, h, quality=1.0)
-                    grasps.append(grasp)
-        
-        return grasps
+    def __init__(self, dataset_path):
+        self.samples = discover_samples([dict(type='original_jacquard', path=dataset_path)])
+
+    def load_grasps(self, grasps_path):
+        grasps = load_grasps(dict(format='jacquard', grasps_path=grasps_path))
+        return [GraspRectangle(g[0], g[1], math.degrees(g[4]), g[2], g[3]) for g in grasps]
 
 
 class GraspAugmenter:
-    """Handles augmentation of images and grasp annotations"""
-    
-    def __init__(self, config: AugmentationConfig):
+    def __init__(self, config):
         self.config = config
-        
-        if ALBUMENTATIONS_AVAILABLE:
-            # Define augmentation pipeline using albumentations
-            self.transform = A.Compose([
-                A.RandomRotate90(p=0.5),
-                A.Rotate(limit=config.rotation_limit, p=0.8),
-                A.RandomResizedCrop(
-                    size=(config.output_size[1], config.output_size[0]),
-                    scale=(config.crop_ratio_min, config.crop_ratio_max),
-                    ratio=(0.75, 1.33),
-                    p=0.8
-                ),
-                A.ColorJitter(
-                    brightness=config.brightness_limit,
-                    contrast=config.contrast_limit,
-                    p=0.5
-                ),
-                A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-                A.GaussNoise(var_limit=(10.0, 50.0), mean=0, p=0.3),
-            ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=True))
-        else:
-            self.transform = None
-    
-    def _opencv_augment(self, image: np.ndarray, grasps: List[GraspRectangle]) -> Tuple[np.ndarray, List[GraspRectangle]]:
-        """OpenCV-based augmentation fallback"""
-        height, width = image.shape[:2]
-        aug_image = image.copy()
-        aug_grasps = []
-        
-        # Random rotation
-        if random.random() < 0.8:
-            angle = random.uniform(-self.config.rotation_limit, self.config.rotation_limit)
-            center = (width // 2, height // 2)
-            rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-            
-            # Apply rotation to image
-            aug_image = cv2.warpAffine(aug_image, rotation_matrix, (width, height))
-            
-            # Apply rotation to grasps
-            for grasp in grasps:
-                corners = grasp.get_corners()
-                # Add homogeneous coordinate
-                corners_hom = np.column_stack([corners, np.ones(4)])
-                # Apply rotation
-                rotated_corners = np.dot(rotation_matrix, corners_hom.T).T
-                
-                new_grasp = GraspRectangle.from_corners(rotated_corners, grasp.quality)
-                if new_grasp.is_valid(width, height):
-                    aug_grasps.append(new_grasp)
-        else:
-            aug_grasps = grasps.copy()
-        
-        # Random crop and resize
-        if random.random() < 0.8:
-            crop_ratio = random.uniform(self.config.crop_ratio_min, self.config.crop_ratio_max)
-            new_width = int(width * crop_ratio)
-            new_height = int(height * crop_ratio)
-            
-            if new_width < width and new_height < height:
-                # Random crop position
-                x_start = random.randint(0, width - new_width)
-                y_start = random.randint(0, height - new_height)
-                
-                # Crop image
-                cropped_image = aug_image[y_start:y_start+new_height, x_start:x_start+new_width]
-                
-                # Resize to output size
-                aug_image = cv2.resize(cropped_image, self.config.output_size)
-                
-                # Scale factor for grasps
-                scale_x = self.config.output_size[0] / new_width
-                scale_y = self.config.output_size[1] / new_height
-                
-                # Update grasps
-                valid_grasps = []
-                for grasp in aug_grasps:
-                    # Translate grasp coordinates
-                    new_center_x = (grasp.center_x - x_start) * scale_x
-                    new_center_y = (grasp.center_y - y_start) * scale_y
-                    new_width_g = grasp.width * scale_x
-                    new_height_g = grasp.height * scale_y
-                    
-                    new_grasp = GraspRectangle(new_center_x, new_center_y, grasp.angle, 
-                                             new_width_g, new_height_g, grasp.quality)
-                    
-                    if new_grasp.is_valid(self.config.output_size[0], self.config.output_size[1]):
-                        valid_grasps.append(new_grasp)
-                
-                aug_grasps = valid_grasps
-            else:
-                # Just resize
-                aug_image = cv2.resize(aug_image, self.config.output_size)
-                scale_x = self.config.output_size[0] / width
-                scale_y = self.config.output_size[1] / height
-                
-                for grasp in aug_grasps:
-                    grasp.center_x *= scale_x
-                    grasp.center_y *= scale_y
-                    grasp.width *= scale_x
-                    grasp.height *= scale_y
-        else:
-            # Just resize to output size
-            aug_image = cv2.resize(aug_image, self.config.output_size)
-            scale_x = self.config.output_size[0] / width
-            scale_y = self.config.output_size[1] / height
-            
-            for grasp in aug_grasps:
-                grasp.center_x *= scale_x
-                grasp.center_y *= scale_y
-                grasp.width *= scale_x
-                grasp.height *= scale_y
-        
-        # Color augmentations
-        if random.random() < 0.5:
-            # Brightness
-            brightness_factor = random.uniform(1 - self.config.brightness_limit, 1 + self.config.brightness_limit)
-            aug_image = np.clip(aug_image * brightness_factor, 0, 255).astype(np.uint8)
-            
-            # Contrast
-            contrast_factor = random.uniform(1 - self.config.contrast_limit, 1 + self.config.contrast_limit)
-            mean = np.mean(aug_image)
-            aug_image = np.clip((aug_image - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
-        
-        # Gaussian noise
-        if random.random() < 0.3:
-            noise = np.random.normal(0, random.uniform(10, 50), aug_image.shape).astype(np.int16)
-            aug_image = np.clip(aug_image.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-        
-        return aug_image, aug_grasps
-    
-    def augment_sample(self, rgb_image: np.ndarray, depth_image: np.ndarray, grasps: List[GraspRectangle]) -> Tuple[np.ndarray, np.ndarray, List[GraspRectangle]]:
-        """Apply augmentation to image and grasps"""
-        
-        if ALBUMENTATIONS_AVAILABLE and len(grasps) > 0:
-            # Convert grasps to keypoints for albumentations
-            keypoints = []
-            for grasp in grasps:
-                corners = grasp.get_corners()
-                for corner in corners:
-                    keypoints.append(corner.tolist())
-            
-            # Apply transformation
-            transformed = self.transform(image=rgb_image, keypoints=keypoints)
-            aug_rgb = transformed['image']
-            aug_keypoints = transformed['keypoints']
-            
-            # Apply same transformation to depth image (without color augmentations)
-            depth_transform = A.Compose([
-                A.RandomRotate90(p=0.5),
-                A.Rotate(limit=self.config.rotation_limit, p=0.8),
-                A.RandomResizedCrop(
-                    size=(self.config.output_size[1], self.config.output_size[0]),
-                    scale=(self.config.crop_ratio_min, self.config.crop_ratio_max),
-                    ratio=(0.75, 1.33),
-                    p=0.8
-                ),
-            ], additional_targets={'depth': 'image'})
-            
-            depth_transformed = depth_transform(image=rgb_image, depth=depth_image)
-            aug_depth = depth_transformed['depth']
-            
-            # Reconstruct grasps from transformed keypoints
-            aug_grasps = []
-            for i in range(0, len(aug_keypoints), 4):
-                if i + 3 < len(aug_keypoints):
-                    corners = np.array(aug_keypoints[i:i+4])
-                    original_grasp = grasps[i//4]
-                    new_grasp = GraspRectangle.from_corners(corners, original_grasp.quality)
-                    
-                    # Validate grasp
-                    if new_grasp.is_valid(aug_rgb.shape[1], aug_rgb.shape[0]):
-                        aug_grasps.append(new_grasp)
-            
-            return aug_rgb, aug_depth, aug_grasps
-        
-        else:
-            # Use OpenCV-based augmentation
-            aug_rgb, aug_grasps = self._opencv_augment(rgb_image, grasps)
-            aug_depth, _ = self._opencv_augment(depth_image, [])  # Don't augment depth colors
-            
-            return aug_rgb, aug_depth, aug_grasps
+        if not (0 < config.crop_ratio_min <= config.crop_ratio_max <= 1):
+            raise ValueError('Crop ratios must satisfy 0 < min <= max <= 1')
+        if not (0 < config.zoom_min <= config.zoom_max):
+            raise ValueError('Zoom factors must be positive and ordered')
 
-
-def save_augmented_data(output_dir: Path, sample_id: str, aug_id: int, 
-                       rgb_image: np.ndarray, depth_image: np.ndarray, 
-                       grasps: List[GraspRectangle], dataset_type: str):
-    """Save augmented data in organized structure"""
-    
-    # Create output directories
-    rgb_dir = output_dir / 'rgb'
-    depth_dir = output_dir / 'depth'
-    annotations_dir = output_dir / 'annotations'
-    
-    for dir_path in [rgb_dir, depth_dir, annotations_dir]:
-        dir_path.mkdir(parents=True, exist_ok=True)
-    
-    # Generate filenames
-    base_name = f"{sample_id}_aug_{aug_id}"
-    
-    # Save RGB image
-    rgb_path = rgb_dir / f"{base_name}.png"
-    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
-    
-    # Save depth image
-    depth_path = depth_dir / f"{base_name}.png"
-    if depth_image.dtype != np.uint16:
-        depth_image = (depth_image * 65535).astype(np.uint16)
-    cv2.imwrite(str(depth_path), depth_image)
-    
-    # Save annotations
-    ann_path = annotations_dir / f"{base_name}.json"
-    annotations = {
-        'image_id': base_name,
-        'dataset_source': dataset_type,
-        'grasps': []
-    }
-    
-    for grasp in grasps:
-        corners = grasp.get_corners()
-        annotations['grasps'].append({
-            'center_x': float(grasp.center_x),
-            'center_y': float(grasp.center_y),
-            'angle': float(grasp.angle),
-            'width': float(grasp.width),
-            'height': float(grasp.height),
-            'quality': float(grasp.quality),
-            'corners': corners.tolist()
-        })
-    
-    with open(ann_path, 'w') as f:
-        json.dump(annotations, f, indent=2)
-
-
-def augment_datasets(cornell_path: str, jacquard_path: str, output_path: str, config: AugmentationConfig):
-    """Main function to augment Cornell dataset only (Jacquard has enough data)"""
-    
-    output_dir = Path(output_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize only Cornell dataset - Jacquard has sufficient data already
-    cornell_dataset = CornellDataset(cornell_path) if os.path.exists(cornell_path) else None
-    jacquard_dataset = None  # Skip Jacquard dataset processing
-    
-    # Initialize augmenter
-    augmenter = GraspAugmenter(config)
-    
-    total_samples = 0
-    augmented_samples = 0
-    
-    # Process Cornell dataset
-    if cornell_dataset:
-        print(f"Processing Cornell dataset: {len(cornell_dataset.samples)} samples")
-        
-        for i, sample in enumerate(cornell_dataset.samples):
-            try:
-                # Load images
-                rgb_image = cv2.imread(sample['rgb_path'])
-                rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
-                depth_image = cv2.imread(sample['depth_path'], cv2.IMREAD_UNCHANGED)
-                
-                # Load grasps
-                grasps = cornell_dataset.load_grasps(
-                    sample['pos_grasps_path'], 
-                    sample.get('neg_grasps_path')
-                )
-                
-                # Generate augmentations
-                for aug_id in range(config.num_augmentations):
-                    aug_rgb, aug_depth, aug_grasps = augmenter.augment_sample(
-                        rgb_image, depth_image, grasps
-                    )
-                    
-                    if len(aug_grasps) > 0:  # Only save if valid grasps remain
-                        save_augmented_data(
-                            output_dir, f"cornell_{i:06d}", aug_id,
-                            aug_rgb, aug_depth, aug_grasps, 'cornell'
-                        )
-                        augmented_samples += 1
-                
-                total_samples += 1
-                if total_samples % 100 == 0:
-                    print(f"Processed {total_samples} samples, generated {augmented_samples} augmentations")
-                    
-            except Exception as e:
-                print(f"Error processing Cornell sample {i}: {e}")
+    def augment_sample(self, rgb_image, depth_image, grasps):
+        if depth_image.shape[:2] != rgb_image.shape[:2]:
+            raise ValueError('RGB and depth must be registered with equal image dimensions')
+        height, width = rgb_image.shape[:2]
+        out_w, out_h = self.config.output_size
+        crop = random.uniform(self.config.crop_ratio_min, self.config.crop_ratio_max)
+        zoom = random.uniform(self.config.zoom_min, self.config.zoom_max)
+        scale = min(out_w / width, out_h / height) * zoom / crop
+        angle = random.uniform(-self.config.rotation_limit, self.config.rotation_limit)
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, scale)
+        jitter_x = random.uniform(-1, 1) * out_w * (1 - crop) / 2
+        jitter_y = random.uniform(-1, 1) * out_h * (1 - crop) / 2
+        matrix[:, 2] += [(out_w - width) / 2 + jitter_x, (out_h - height) / 2 + jitter_y]
+        rgb = cv2.warpAffine(rgb_image, matrix, (out_w, out_h), flags=cv2.INTER_LINEAR)
+        depth = cv2.warpAffine(depth_image, matrix, (out_w, out_h), flags=cv2.INTER_NEAREST)
+        transformed = []
+        for grasp in grasps:
+            if grasp.quality <= .5:
                 continue
-    
-    # Process Jacquard dataset - SKIPPED (already has sufficient data)
-    print("Skipping Jacquard dataset processing - dataset already has sufficient samples")
-    
-    print(f"\nAugmentation complete!")
-    print(f"Total samples processed: {total_samples}")
-    print(f"Total augmented samples generated: {augmented_samples}")
-    print(f"Output directory: {output_dir}")
+            corners = np.column_stack((grasp.get_corners(), np.ones(4))) @ matrix.T
+            new_grasp = GraspRectangle.from_corners(corners, grasp.quality)
+            if new_grasp.is_valid(out_w, out_h):
+                transformed.append(new_grasp)
+        # Photometric changes never affect depth or geometric annotations.
+        contrast = random.uniform(1 - self.config.contrast_limit, 1 + self.config.contrast_limit)
+        brightness = random.uniform(-self.config.brightness_limit, self.config.brightness_limit) * 255
+        rgb = np.clip(rgb.astype(np.float32) * contrast + brightness, 0, 255).astype(np.uint8)
+        return rgb, depth, transformed
+
+    def _opencv_augment(self, image, grasps):
+        rgb, _, transformed = self.augment_sample(image, np.zeros(image.shape[:2], np.uint16), grasps)
+        return rgb, transformed
 
 
-def visualize_grasps(image: np.ndarray, grasps: List[GraspRectangle], output_path: str):
-    """Visualize grasp rectangles on image for debugging"""
-    vis_image = image.copy()
-    
+def save_augmented_data(output_dir, sample_id, aug_id, rgb_image, depth_image, grasps,
+                        dataset_type, source_id=None):
+    if not source_id:
+        raise ValueError('source_id is required to keep augmentations in their original training group')
+    output_dir = Path(output_dir)
+    for folder in ('rgb', 'depth', 'annotations'):
+        (output_dir / folder).mkdir(parents=True, exist_ok=True)
+    base = f'{sample_id}_aug_{aug_id}'
+    if not cv2.imwrite(str(output_dir / 'rgb' / (base + '.png')), cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)):
+        raise OSError('Could not write augmented RGB image')
+    if not cv2.imwrite(str(output_dir / 'depth' / (base + '.tiff')), depth_image):
+        raise OSError('Could not write augmented depth image')
+    annotations = dict(image_id=base, dataset_source=dataset_type, source_id=source_id,
+                       geometry_version=2, grasps=[])
     for grasp in grasps:
-        corners = grasp.get_corners().astype(int)
-        
-        # Draw grasp rectangle
-        color = (0, 255, 0) if grasp.quality > 0.5 else (0, 0, 255)
-        cv2.polylines(vis_image, [corners], True, color, 2)
-        
-        # Draw center point
-        center = (int(grasp.center_x), int(grasp.center_y))
-        cv2.circle(vis_image, center, 3, color, -1)
-        
-        # Draw orientation line
-        angle_rad = np.radians(grasp.angle)
-        end_x = int(grasp.center_x + 20 * np.cos(angle_rad))
-        end_y = int(grasp.center_y + 20 * np.sin(angle_rad))
-        cv2.line(vis_image, center, (end_x, end_y), color, 2)
-    
-    cv2.imwrite(output_path, cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+        if grasp.quality <= .5:
+            continue
+        annotations['grasps'].append(dict(center_x=grasp.center_x, center_y=grasp.center_y,
+                                          angle=grasp.angle, width=grasp.width, height=grasp.height,
+                                          quality=grasp.quality, corners=grasp.get_corners().tolist()))
+    (output_dir / 'annotations' / (base + '.json')).write_text(json.dumps(annotations, indent=2) + '\n')
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Augment Cornell grasp detection dataset (Jacquard skipped - has enough data)")
-    parser.add_argument("--cornell_path", type=str, default="./cornell_dataset", 
-                       help="Path to Cornell dataset")
-    parser.add_argument("--jacquard_path", type=str, default="./jacquard_dataset",
-                       help="Path to Jacquard dataset (will be skipped)")
-    parser.add_argument("--output_path", type=str, default="./augmented_dataset",
-                       help="Output path for augmented dataset")
-    parser.add_argument("--num_augmentations", type=int, default=5,
-                       help="Number of augmentations per Cornell sample")
-    parser.add_argument("--rotation_limit", type=int, default=45,
-                       help="Maximum rotation angle in degrees")
-    parser.add_argument("--crop_ratio_min", type=float, default=0.7,
-                       help="Minimum crop ratio")
-    parser.add_argument("--crop_ratio_max", type=float, default=1.0,
-                       help="Maximum crop ratio")
-    parser.add_argument("--visualize", action="store_true",
-                       help="Save visualization of first few samples")
-    
+def augment_datasets(cornell_path, jacquard_path, output_path, config, split_manifest=None):
+    dataset = CornellDataset(cornell_path)
+    training_ids = set(read_split(split_manifest)['train_ids']) if split_manifest else None
+    augmenter = GraspAugmenter(config)
+    generated = 0
+    for sample in dataset.samples:
+        if training_ids is not None and sample['sample_id'] not in training_ids:
+            continue
+        image = cv2.imread(sample['rgb_path'])
+        if image is None:
+            raise ValueError(f"Cannot read {sample['rgb_path']}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        depth = (cv2.imread(sample['depth_path'], cv2.IMREAD_UNCHANGED)
+                 if sample['depth_path'] else np.zeros(image.shape[:2], np.uint16))
+        if depth is None:
+            raise ValueError(f"Cannot read {sample['depth_path']}")
+        grasps = dataset.load_grasps(sample['pos_grasps_path'])
+        # The source path gives stable names independent of file enumeration order.
+        name = sample['sample_id'].replace('/', '_')
+        for aug_id in range(config.num_augmentations):
+            rgb, aug_depth, augmented = augmenter.augment_sample(image, depth, grasps)
+            if augmented:
+                save_augmented_data(output_path, name, aug_id, rgb, aug_depth, augmented,
+                                    'cornell', source_id=sample['sample_id'])
+                generated += 1
+    print(f'Generated {generated} Cornell augmentations in {output_path}')
+
+
+def visualize_grasps(image, grasps, output_path):
+    result = image.copy()
+    for grasp in grasps:
+        cv2.polylines(result, [grasp.get_corners().astype(np.int32)], True, (0, 255, 0), 2)
+    cv2.imwrite(str(output_path), cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Augment Cornell with consistent oriented geometry')
+    parser.add_argument('--cornell_path', default='./cornell_dataset')
+    parser.add_argument('--jacquard_path', default='./jacquard_dataset', help='Unused; Cornell-only augmentation')
+    parser.add_argument('--output_path', default='./augmented_dataset')
+    parser.add_argument('--split_manifest', help='Generate training images only from this saved split')
+    parser.add_argument('--num_augmentations', type=int, default=5)
+    parser.add_argument('--rotation_limit', type=float, default=45)
+    parser.add_argument('--crop_ratio_min', type=float, default=.7)
+    parser.add_argument('--crop_ratio_max', type=float, default=1.)
+    parser.add_argument('--visualize', action='store_true')
     args = parser.parse_args()
-    
-    # Create configuration
-    config = AugmentationConfig(
-        rotation_limit=args.rotation_limit,
-        crop_ratio_min=args.crop_ratio_min,
-        crop_ratio_max=args.crop_ratio_max,
-        num_augmentations=args.num_augmentations
-    )
-    
-    # Run augmentation
-    augment_datasets(
-        args.cornell_path,
-        args.jacquard_path,
-        args.output_path,
-        config
-    )
-    
-    # Optional visualization
+    config = AugmentationConfig(num_augmentations=args.num_augmentations, rotation_limit=args.rotation_limit,
+                                crop_ratio_min=args.crop_ratio_min, crop_ratio_max=args.crop_ratio_max)
+    augment_datasets(args.cornell_path, args.jacquard_path, args.output_path, config, args.split_manifest)
     if args.visualize:
-        print("Creating visualizations...")
-        # Add visualization code here if needed
+        root = Path(args.output_path)
+        for annotation in sorted((root / 'annotations').glob('*.json'))[:5]:
+            metadata = json.loads(annotation.read_text())
+            image = cv2.cvtColor(cv2.imread(str(root / 'rgb' / (annotation.stem + '.png'))), cv2.COLOR_BGR2RGB)
+            grasps = [GraspRectangle.from_corners(g['corners']) for g in metadata['grasps']]
+            visualize_grasps(image, grasps, root / (annotation.stem + '_preview.png'))
+
+
+if __name__ == '__main__':
+    main()
